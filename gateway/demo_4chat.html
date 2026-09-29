@@ -1,0 +1,1547 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>多路并发推理演示</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e9ef;
+          --dim:#8b94a7; --accent:#4da3ff; --ok:#3ddc84; --warn:#ffb454;
+          --danger:#ff6b6b; --sunken:#0d1017; }
+  * { box-sizing:border-box; }
+  /* 整页 = 一列，**高度正好一屏**（2026-09-20 改）。改之前是"三块各管各的高度"：
+     面板写死 `calc(50vh - 60px)`、资源区跟着内容长，三块加起来不到一屏 ⇒ 屏幕上
+     对话框下面留一大片空。现在由**上面两块让位给中间那块**：标题和资源区按内容长，
+     中间的对片区吃掉剩下的全部高度，谁也不会多出一段空白。
+     用 `height:100%` 而不是 `100vh`：`html` 的 100% 就是可视高度，链下来比 `100vh`
+     在移动端（地址栏会伸缩）稳。 */
+  html, body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+         display:flex; flex-direction:column; overflow:hidden; }
+  header { flex:none; display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+           padding:12px 18px; border-bottom:1px solid var(--line); background:#12151b; }
+  .brand { display:flex; align-items:center; gap:12px; flex-wrap:wrap; min-width:0; }
+  h1 { font-size:17px; margin:0; font-weight:600; letter-spacing:.3px; }
+
+  /* 状态徽标：一个灯 + 一两个词。灯的颜色**由 JS 换 class**（.badge.<state>），不是写死的
+     emoji —— emoji 在 Windows/安卓/iOS 上长得不一样，投影出来还可能是个方框。 */
+  .badge { display:inline-flex; align-items:center; gap:6px; padding:3px 10px 3px 8px;
+           border:1px solid var(--line); border-radius:999px; background:var(--sunken);
+           color:var(--dim); font-size:13px; white-space:nowrap;
+           font-variant-numeric:tabular-nums; }
+  .badge .led { width:8px; height:8px; border-radius:50%; background:var(--dim); }
+  .badge.idle { color:var(--ok); border-color:#1f3a2b; }
+  .badge.idle .led { background:var(--ok); box-shadow:0 0 6px rgba(61,220,132,.65); }
+  .badge.busy { color:var(--warn); border-color:#3d3120; }
+  .badge.busy .led { background:var(--warn); box-shadow:0 0 6px rgba(255,180,84,.65);
+                     animation:pulse 1.1s infinite; }
+  .badge.wait { color:var(--accent); border-color:#1e3550; }
+  .badge.wait .led { background:var(--accent); animation:pulse 1.1s infinite; }
+  .badge.err { color:var(--danger); border-color:#43222a; }
+  .badge.err .led { background:var(--danger); }
+  #gstats { font-variant-numeric:tabular-nums; }
+
+  /* 右侧控件组：一行排开、垂直居中、间距 16px。 */
+  .controls { margin-left:auto; display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  label.tog { color:var(--dim); font-size:13px; display:flex; align-items:center; gap:6px;
+              cursor:pointer; }
+  /* 复选框自己画：`accent-color` 只管**勾上**之后那个方块的颜色，**没勾时浏览器照样画
+     一个纯白方块** —— 深色页面上最扎眼的就是它（而且是默认状态）。 */
+  input[type=checkbox] { appearance:none; -webkit-appearance:none; position:relative; margin:0;
+                         width:15px; height:15px; border:1px solid var(--line); border-radius:4px;
+                         background:var(--sunken); cursor:pointer;
+                         transition:background .15s,border-color .15s; }
+  input[type=checkbox]:hover { border-color:#3d4657; }
+  input[type=checkbox]:checked { background:var(--accent); border-color:var(--accent); }
+  input[type=checkbox]:checked::after { content:""; position:absolute; left:4px; top:1px;
+                                        width:4px; height:8px; border:solid #06121f;
+                                        border-width:0 2px 2px 0; transform:rotate(45deg); }
+  input[type=checkbox]:focus-visible { outline:2px solid rgba(77,163,255,.45); outline-offset:1px; }
+
+  /* 数字输入框：外框自己画、内阴影压在里层。**不用裸 input** —— 浏览器默认那圈 inset 在深色
+     底上几乎看不见，投影仪下就是个没有边界的数字。 */
+  .numbox { display:inline-flex; align-items:center; gap:3px; padding:2px 8px;
+            background:var(--sunken); border:1px solid var(--line); border-radius:6px;
+            box-shadow:inset 0 1px 2px rgba(0,0,0,.5);
+            transition:border-color .15s,box-shadow .15s; }
+  .numbox:hover { border-color:#31384a; }
+  .numbox:focus-within { border-color:var(--accent);
+                         box-shadow:inset 0 1px 2px rgba(0,0,0,.5),0 0 0 2px rgba(77,163,255,.16); }
+  .numbox input[type=number] { width:58px; padding:2px 0; border:0; background:transparent;
+                               color:var(--fg); font:inherit; font-size:13px; text-align:right;
+                               outline:0; font-variant-numeric:tabular-nums;
+                               -moz-appearance:textfield; }
+  .numbox input[type=number]::-webkit-outer-spin-button,
+  .numbox input[type=number]::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
+  .numbox .unit { color:var(--dim); font-size:12px; }
+
+  /* 按钮三级：主（亮蓝实心）/ 次（描边透明）/ 危险（深灰，hover 才红）。
+     基础 button 是**中性**的 —— 没挂变体类的按钮不该被误当成主按钮。 */
+  button { border:1px solid transparent; border-radius:6px; padding:8px 15px; font-size:14px;
+           font-weight:600; cursor:pointer; font-family:inherit; background:#222836;
+           color:var(--fg); transition:background .15s,border-color .15s,color .15s; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .btn-primary { background:var(--accent); color:#06121f; }
+  .btn-primary:hover:not(:disabled) { background:#6cb2ff; }
+  .btn-secondary { background:transparent; border-color:var(--line); color:var(--fg);
+                   font-weight:500; }
+  .btn-secondary:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  .btn-danger { background:#222836; color:var(--dim); font-weight:500; }
+  .btn-danger:hover:not(:disabled) { background:#3a1d22; color:var(--danger); }
+
+  /* 顶部那行汇总（单路基线 / 四路聚合）。**空的时候不占高度** —— 没消息就不留一条白带。 */
+  /* `flex:none`：这两行是标题与对片区之间的"固定条"，高度由内容决定，不许被
+     对片区挤（不写的话长句子会被压扁换行——默认的 `flex-shrink:1` 就是干这个的）。 */
+  .sumline { flex:none; color:var(--dim); font-size:13px;
+             font-variant-numeric:tabular-nums; }
+  .sumline:not(:empty) { padding:9px 18px; border-bottom:1px solid var(--line); background:#12151b; }
+  .sumline b { color:var(--ok); font-size:15px; }
+
+  /* 容量条：**常驻一行**，写清"当前上下文 / 后端开了几个会话 / 开了几个窗口"。
+     为什么它必须单独占一行而不是挤进汇总行：汇总行是 setSum 管的，一有结果就被
+     整句覆盖——而"为什么只能开 2 个窗口"这件事在**任何时候**都得看得见（32K 时每路
+     KV 要 406.7 MB/卡，每卡只够 2 路；窗口开多了就是排队，不是并发）。
+     超了会变警告色：那只可能是后端被换成会话更少的配置而页面还开着。 */
+  .capline { flex:none; color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums;
+             padding:7px 18px; border-bottom:1px solid var(--line); }
+  .capline b { color:var(--fg); font-weight:600; }
+  .capline.over { color:var(--warn); }
+  .capline.over b { color:var(--warn); }
+
+  /* 资源使用：RK3588（本机现读）+ RK1828（后端 STAT 帧）+ 热区 + 服务状态。
+     它**在页面最底部、一整块**（2026-09-20 从标题下面挪下来）。挪的理由两条：
+     ① 原先它是标题与对话区之间的一条线——每核小柱 + 四张卡 + 服务状态全挤在一行、
+        格间只有 5px，投影仪上像一张发票；② 它抢在对话前面，第一眼看到的是"内存 60%"
+        而不是这一页真正要给人看的回答。
+     现在按"一块 = 一样东西"分块（一张卡 / RK3588 / 热区 / 服务），块内一行一个指标、
+     条子撑满行宽，块间 10px。**不是把它藏起来**：它仍常驻可见——它回答的是"此刻板卡
+     到底在干什么"，这个数任何时候都得看得见，只是不再跟对话抢地方。
+     **两半的可信度不一样，所以分块、并各带自己的时间**：RK3588 那块是这一秒现读的，
+     RK1828 那几块来自后端的一包原子量、带"多久之前采的"。底部那句 note 不是客套话：
+     RK1828 是 PCIe 设备（驱动 rkep），主机侧既没有 hwmon 也没有 NPU 利用率查询接口，
+     不写出来屏幕上那两个百分数会被当成硬件读数读走。
+     高度上它**钉在页面底部**（`flex:0 0 auto` = 按内容长、**且不许被压小**）：屏幕够高时
+     对话区自然把它剩下的都吃掉；屏幕矮时这条 `max-height` 封顶，超出的部分它**在自己
+     里面滚**，既不把对话区挤扁，也不会把内容顶出屏幕。
+     ⚠️ 2026-09-20 把 `flex-shrink` 从 1 改成 0：原来它和 `main` 都是 `1`，矮屏上多出来的
+     高度按基准尺寸**在两块之间分摊**，于是它被压到**比 `max-height` 还小**（实测 1366×768
+     下 249px 的内容只分到 185px），底部那句"NPU 是卡级忙时占比"的说明被切掉了——而那句
+     正是防止屏幕上两个百分数被当成硬件读数读走的。改成 0 之后它的高度只有两种可能：
+     装得下就按内容（1600 上 221px）、装不下就正好卡在 `max-height`（1366 上 227.8px），
+     要挤就全部由 `main` 让（`main` 本来就是 `min-height:0` + 自己滚的那个）。
+     **34vh 不是"目标比例"，是矮屏的保险**：并排之后这一块实测 250px，1080p（可视
+     1010px）上占 25%、1440p 上占 17%，正是用户要的 1/5~1/4；只有可视高度掉到 735px
+     以下时才轮到这条上限起作用（那时它滚，而不是继续挤压对话区）。 */
+  .syssec { flex:0 0 auto; max-height:34vh; overflow:auto;
+            margin:0 12px 12px; background:var(--panel); border:1px solid var(--line);
+            border-radius:10px; padding:12px 14px 13px; }
+  .syssec .shead { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap;
+                   margin:0 0 11px; }
+  .syssec .shead h2 { margin:0; font-size:13px; font-weight:600; letter-spacing:.3px; }
+  /* 七块卡片**在同一个网格里、一条线上、一样高**（2026-09-20 第二次改）。
+     原来两栏各自按内容长（`align-items:start` + `align-content:start`），于是右侧四张卡
+     比左侧三块矮 48px，两条底边不齐——用户报的就是这个（"高低不平"）。
+     改法三步，缺一步都不齐：
+       ① 外层 `.swrap` 的 `align-items` 用**默认的 stretch**（原来是 start）⇒ 两个子网格
+          等高，高度 = 左三块与右四块里**最高的那一块**；
+       ② 子网格 `.sgrid` 的 `align-content` 也要 stretch（原来是 start）——**这一条最容易漏**：
+          单行的网格在 `align-content:start` 下只占内容高，外层的 stretch 传不到卡片上；
+       ③ `.sblock` 默认 `align-self:stretch`，于是每块都被拉满这一行。
+     列数**写死**（左 3 右 4、都用 `minmax(0,1fr)`）而不是 `auto-fit`：auto-fit 会在
+     1500px 以下自己折行（实测 1366 上右栏折成 3+1、1280 上左栏折成 2+1），一折行
+     两组的高度就再也对不上，而且整块反而更高（245→293px）。写死之后卡片只是变窄，
+     永远是一条线。左右的比例取 3:4，正好让七张卡**一样宽**。
+     窄屏（<1180px）退回上下两组——那时 7 列每张只有 160px 上下，数字会挤成两行。 */
+  .syssec .swrap { display:grid; gap:10px; align-items:stretch;
+                   grid-template-columns:minmax(0,3fr) minmax(0,4fr); }
+  .syssec .sgrid { display:grid; gap:10px; align-content:stretch; }
+  .syssec .sg-host { grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .syssec .sg-cards { grid-template-columns:repeat(4,minmax(0,1fr)); }
+  @media (max-width:1180px) { .syssec .swrap { grid-template-columns:1fr; } }
+  /* 一块 = 一样东西。**边框是刻意的**：四张卡各自成块，屏幕上立刻能数出"四张卡"，
+     而排成一行时它们看起来是一条数据线。
+     `display:flex` + `justify-content:flex-start` 是为了等高之后内容仍然**贴顶**：
+     齐平的是底边，不是里面的行；内容少的那块（比如 RK3588 那块只有 CPU/内存/负载三行）
+     多出来的空白全留在底部，七块卡片的块头和第一行数据因此横向对齐成一排。 */
+  .sblock { border:1px solid var(--line); border-radius:9px; background:#12151b;
+            padding:9px 11px 10px; min-width:0; font-size:12px; color:var(--dim);
+            display:flex; flex-direction:column; justify-content:flex-start; }
+  .sblock .bhead { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;
+                   margin-bottom:8px; }
+  /* `flex-wrap:wrap` + `row-gap:2px` 是给**窄卡片**准备的：一行里最后那段说明文字
+     （"6.3 GB / 15.6 GB"、"· 开机 3d 4h"）在卡片只有 160px 宽时放不下，不折行的话
+     它会在**自己内部**一个词一个词地折——实测 1280 上"内存"那一行折成了 40+34 两截、
+     整行 74px 高（四行），屏幕上是一列断词。给它 `.m`（`white-space:nowrap`）之后它是
+     一个整体，再允许行折，它整段挪到第二行去。 */
+  .syssec .srow { display:flex; align-items:center; gap:9px; min-width:0;
+                  flex-wrap:wrap; row-gap:2px; font-variant-numeric:tabular-nums; }
+  .syssec .srow + .srow { margin-top:7px; }
+  /* "服务"那一块里的五行改**两列**（后端/会话/排队/数据/网关）：它是七块里行数最多的一块，
+     等高之后正是它把整条线的高度顶上去。两列之后 5 行变 3 行，条子的高度就由"跟它一样高"
+     变成"跟四张卡一样高"了。
+     行距交给 grid 的 gap（`7px 9px` = 与上面 `.srow + .srow` 同一档），所以要把那条
+     margin 抵消掉——两套间距叠在一起会变成 14px。 */
+  .syssec .svc { display:grid; grid-template-columns:repeat(2,minmax(0,1fr));
+                 gap:7px 9px; }
+  .syssec .svc .srow + .srow { margin-top:0; }
+  /* 格子里那点余量再抠 5px：1600 上一格 89.5px，而"网关 已跑 8m"要 89px，差一点就折行。 */
+  .syssec .svc .srow { gap:7px; }
+  .syssec .svc .srow .lab { width:29px; }
+  /* 但**窄屏上两列反而更糟**：七张卡片并排、每张掉到 160px 上下时每格只有 ~65px，
+     「数据 0.0s 前」装不进一格就自己折成两行，五个格子一共折出六行——比一列五行还高
+     （实测 1280 上 210px vs 192px）。所以这一段退回一列。1500 是实测的转折点：1600 上
+     两列 3 行、一列 5 行；1366 上两列已经折到 5 行以上，一列赢。
+     下界 1181px **不能省**：再窄就退回上下两组，卡片又变回 360px 宽、两列完全放得下，
+     那时单列反而把这一块顶高 48px（实测 1180 上 235px vs 187px）。 */
+  @media (max-width:1500px) and (min-width:1181px) {
+    .syssec .svc { grid-template-columns:1fr; }
+  }
+  /* 标签固定宽度，几行的数字才会对齐成一列；`flex:none` 保证它不被条子挤扁。 */
+  .syssec .srow .lab { flex:none; width:32px; color:#5f6878; font-size:11px; }
+  /* 条子**撑满行宽**（不再是 52px 的小方块）：一块里只有一条，宽一点才能一眼看出
+     深浅；块本身是网格里的一格，所以再宽也不会把别的东西挤走。 */
+  .syssec .srow .bar { flex:1; min-width:34px; width:auto; }
+  .syssec b { color:var(--fg); font-weight:600; }
+  .syssec .tag { font-size:10px; letter-spacing:.6px; color:#5f6878; text-transform:uppercase; }
+  .syssec .m { white-space:nowrap; }
+  /* 温度那一行是七块里唯一一条**长度不设上界的**：七个热区名 + 各自的度数，缩写之后
+     （"soc 30° · big0 30° · big1 30° · little 30° · center 30° · gpu 30° · npu 30°"）
+     整条约 430px——1920 上塞得进 255px 的卡才怪；卡片一窄到 207px 就顶出去了
+     （`.m` 是 `nowrap`），于是文字**溢出卡片边框**压在隔壁那张卡上
+     （实测 1600 / 1366 / 1280 上都是这个症状）。
+     改法不是缩字号，是**允许它折行**：整条改成会折的 inline-flex，每个热区各自成为一个
+     不折的格（`.ti`，名字和度数永远在一起）。七格在 255px 的卡上折成 2 行、在 174px
+     （1280）上折成 3 行——**全画出来只多占一两行**，比原来"只画 3 个 + 一个 +4"多不了多少，
+     但被收起来的那四个从此在屏幕上有了入口（"+4" 只有鼠标停上去才看得到，触屏上点不出来）。
+     ⚠️ 分隔符 `·` 是**真文本**（写在每一格的开头，见 `thermHtml`），不是这里的 `::after`
+     ——生成的内容复制不出来、读屏软件时常也不念，屏幕上明明是"soc 30° · big0 30°"、
+     复制下来却成了"soc 30°big0 30°"。**这一条的检查在 page_check.js 里**（它读的是
+     页面真跑出来的文本），别在这里加 `content:"·"`。
+     它同时是 `.srow` 里唯一的孩子，所以要 `flex:1 1 auto; min-width:0` 才拿得到行宽、
+     才有得折（flex 项默认 `min-width:auto`，会硬撑到内容宽、撑出边框）。 */
+  .syssec .m.therm { flex:1 1 auto; min-width:0; display:inline-flex;
+                     flex-wrap:wrap; align-items:baseline; row-gap:2px; }
+  .syssec .therm .ti { white-space:nowrap; }
+  /* 格子里那个名字：小一号、暗一点。七格要一眼扫完，"哪个是哪个"靠位置和缩写认，
+     数字才是要看的，所以名字不该和数字抢注意力。
+     名字与数字之间那点间隔是 **HTML 里一个字面空格，不是这里的 gap**——`.ti` 是
+     inline 元素（不是 flex，用不着 gap），而且 flex/grid 的 gap 只是布局上的空隙：
+     屏幕上看着有间隔，**复制下来却是 "soc30°"**。同一个文件里 `sRow` 为标签与值之间
+     那个空格写过同样的理由。 */
+  .syssec .therm .tl { color:#5f6878; font-size:11px; }
+  .syssec .dim2 { color:#6b7488; }
+  .syssec .off { color:#5f6878; }
+  .syssec b.warn, .syssec .m.warn { color:var(--warn); }
+  .syssec b.crit { color:var(--danger); }
+  /* 一格资源 = 名字 + 数 + 一条横条。条子自己画：`<progress>` 在深色底上是浏览器默认
+     那套浅色描边，跟这一页对不上，而且各家渲染还不一样。 */
+  .bar { display:inline-block; width:52px; height:6px; border-radius:3px; overflow:hidden;
+         background:#0a0d13; border:1px solid var(--line); vertical-align:middle; flex:none; }
+  .bar i { display:block; height:100%; width:0; background:var(--accent);
+           transition:width .5s ease; }
+  .bar.warn i { background:var(--warn); }
+  .bar.crit i { background:var(--danger); }
+  /* 8 个核一根小柱子。高度**就是**占用率（0% 就是空柱子），不设最小高度——
+     给 0% 留一根看得见的"底座"就等于编了一个数出来。 */
+  .cores { display:inline-flex; gap:2px; align-items:stretch; height:15px; flex:none; }
+  .cores i { width:5px; border-radius:2px; background:#0a0d13; border:1px solid var(--line);
+             display:flex; align-items:flex-end; overflow:hidden; }
+  .cores i span { display:block; width:100%; background:var(--accent); }
+
+  /* 对片区 = **吃掉标题和资源区之外的全部高度**（`flex:1 1 auto` + `min-height:0`：
+     后者是必须的，flex 项默认不肯缩到比内容还矮，少了它这块会顶破 body）。
+     `grid-auto-rows:minmax(0,1fr)` 让"几行面板"平分这块高度——两个窗口是一行，
+     四个窗口是两行；行高不写死，屏幕高矮都能铺满。`overflow:auto` 是留给"窗口矮到
+     撑不下 min-height"那一种情况的，那时滚这块，而不是整个页面。 */
+  main { flex:1 1 auto; min-height:0; overflow:auto;
+         display:grid; grid-template-columns:1fr 1fr; grid-auto-rows:minmax(0,1fr);
+         gap:12px; padding:12px; }
+  /* 面板高度**由所在网格行决定**（默认 stretch），不再是写死的 `calc(50vh - 60px)`。
+     `min-height` 留一个下限：矮屏上宁可让 main 滚，也不要把输入框挤没。 */
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           display:flex; flex-direction:column; min-height:240px; }
+  .panel.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .phead { display:flex; align-items:center; gap:8px; padding:9px 14px;
+           border-bottom:1px solid var(--line); font-size:13px; }
+  .phead .name { font-weight:600; }
+  /* 每个窗口一个 ×。小、不抢眼，但要够大好戳——演示时是鼠标在点它。
+     删掉它=这段对话不要了，会话**当场交还**（不等 IDLE_TTL）：网关只排队不抢占，
+     留着不放的话下一个窗口要等到超时才有位置，而屏幕上一点异常都看不出来。 */
+  .phead .close { border:0; background:transparent; color:var(--dim); font-size:15px;
+                  line-height:1; padding:2px 7px; border-radius:5px; cursor:pointer;
+                  font-family:inherit; font-weight:400; }
+  .phead .close:hover:not(:disabled) { background:#3a1d22; color:var(--danger); }
+  .phead .close:disabled { opacity:.3; cursor:not-allowed; }
+  .dot { width:8px; height:8px; border-radius:50%; background:#3a4150; }
+  .dot.on { background:var(--accent); animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.25; } }
+  /* 面板头右侧的性能小字：TTFT + tok/s。**和底部统计行不是一回事** —— 底部那行是记账
+     （token 数、排队拆解、会话与 KV），这里只给投影仪/基准测试看两个数（见 setPerf）。 */
+  .phead .perf { margin-left:auto; color:var(--dim); font-size:12px; white-space:nowrap;
+                 font-variant-numeric:tabular-nums; }
+  .phead .perf b { color:var(--fg); font-weight:600; }
+  /* `min-height:0` 是 flex 那套老规矩：不加的话对话区不肯缩到比内容矮，
+     于是"面板填满网格行"这件事在对话一长就失效（面板被内容顶高、页面出现滚动条）。 */
+  .log { flex:1; min-height:0; overflow-y:auto; padding:14px 16px; }
+  .msg { margin-bottom:10px; white-space:pre-wrap; word-break:break-word; }
+  .msg .who { color:var(--dim); font-size:11px; display:block; }
+  .msg.u .body { color:var(--accent); }
+  .msg.a .body { color:var(--fg); }
+  .msg.err .body { color:var(--danger); }
+  .pfoot { border-top:1px solid var(--line); padding:10px 12px;
+           display:flex; gap:8px; align-items:flex-end; }
+  /* 输入区：多行、高度随内容长（grow()），发送键**内嵌在框里**右下角。内嵌而不是并排，
+     是因为框长高时并排的按钮得跟着重新对齐 —— 嵌进去就永远贴着那一角。 */
+  .inbox { position:relative; flex:1; min-width:0; }
+  .inbox textarea { display:block; width:100%; resize:none; overflow-y:hidden;
+                    background:var(--sunken); border:1px solid var(--line); color:var(--fg);
+                    border-radius:8px; padding:9px 92px 9px 11px; font:inherit; font-size:14px;
+                    line-height:1.5; max-height:120px;
+                    transition:border-color .15s,box-shadow .15s; }
+  .inbox textarea::placeholder { color:#5a6274; }
+  .inbox textarea:focus { outline:0; border-color:var(--accent);
+                          box-shadow:0 0 0 2px rgba(77,163,255,.16); }
+  .inbox .send { position:absolute; right:7px; bottom:7px; width:30px; height:30px; padding:0;
+                 display:flex; align-items:center; justify-content:center;
+                 background:var(--accent); color:#06121f; border-radius:7px; }
+  .inbox .send:hover:not(:disabled) { background:#6cb2ff; }
+  /* 暂停/继续按钮：嵌在发送键左边。平时隐藏（display:none），生成中/暂停后靠 .show 亮出来；
+     文字在「暂停」「继续」之间换（render 里改），所以用文本而不是 SVG。 */
+  .inbox .pause { position:absolute; right:42px; bottom:7px; height:30px; padding:0 10px;
+                  display:none; align-items:center; justify-content:center; white-space:nowrap;
+                  background:var(--warn); color:#06121f; border-radius:7px;
+                  font-size:12px; font-weight:600; }
+  .inbox .pause.show { display:flex; }
+  .stat { padding:6px 16px 10px; color:var(--dim); font-size:12px;
+          font-variant-numeric:tabular-nums; min-height:24px; }
+  .stat b { color:var(--ok); }
+  .hint { color:var(--dim); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>多路并发推理 · Qwen3.5-27B · RK1828 ×4</h1>
+    <!-- 徽标里那句字是 JS 写的（setStatus），灯的颜色也是 JS 换的 -->
+    <span id="status" class="badge idle"><i class="led"></i><span id="gstats">待机</span></span>
+  </div>
+  <div class="controls">
+    <label class="tog"><input type="checkbox" id="think"> 开思考（默认关，屏幕更干净）</label>
+    <label class="tog">输出上限
+      <span class="numbox"><input type="number" id="maxtok" min="1" step="64"><span class="unit">tok</span></span>
+    </label>
+    <button id="addwin" class="btn-secondary" title="新增一个对话窗口">＋ 加窗口</button>
+    <button id="baseline" class="btn-secondary">① 先量单路基线</button>
+    <button id="all" class="btn-primary">② 同时提问</button>
+    <button id="clear" class="btn-danger">清空</button>
+  </div>
+</header>
+
+<!-- 基线/四路聚合那一整句（setSum）。**和徽标分开**：徽标只有一个词，这行是一句话，
+     以前两者挤在 #gstats 里，一句汇总能把标题行撑到换行。 -->
+<div id="cap" class="capline"></div>
+
+<div id="gsum" class="sumline"></div>
+
+<main id="grid"></main>
+
+<!-- 资源使用（JS 每次轮询整块重写）。**常驻可见**：它回答的是"此刻板卡到底在干什么"
+     ——NPU 忙不忙、内存还剩多少、温度上没上来，演示时这几个数比任何一句话都先被问到，
+     所以不藏进弹窗。但**放在对话下面**：它要紧，却不该抢在回答前面（2026-09-20 挪的，
+     原先它挤在标题正下方那一行里，第一眼看到的是"内存 60%"而不是模型答了什么）。 -->
+<section id="sys" class="syssec"></section>
+
+<script>
+"use strict";
+const API = "";                       // 空 = 同源（页面由网关自己发出，见 GET /demo）
+const MODEL = "qwen3.5-27b";
+// 输出上限。**原先是写死的**（`const MAXTOK = 256`），于是同一个板上、同样的问题，
+// 网页永远比终端短一截——终端版是从命令行取的（demo_4session.py 的 NP）。这不是模型或
+// 网关的限制：网关 `_pick_max_tokens` 只把离谱值夹到 2^31-1、不设小上限；后端 main.cc 也会
+// 在 `decode_tokens >= max_new_tokens` 时如实回 `finish_reason=length`。纯粹是这一页少了
+// 个开关。现在给了，并且记住上次的值（演示要对好几个数，刷新一次重填很烦）。
+//
+// 它是**按请求**生效的：每轮带自己的 max_tokens 发出去，改大了不会补上已经截断的那一轮，
+// 得重问。而且真正卡住输出的常常不是它、是上下文——位置用满时后端也会停，
+// 那时 finish_reason 未必是 length。所以统计行只在字面收到 length 时才敢标"触顶截断"。
+const DEFAULT_MAXTOK = 256;
+const MAXTOK_KEY = "demo4chat.maxtok";
+
+function maxtok() {
+  const raw = parseInt(document.getElementById("maxtok").value, 10);
+  // 空/非法/<=0 一律退回默认。**不能让它漏成 0 发出去**：网关把 0 当"用后端自己的默认值"
+  // （`_pick_max_tokens` 的 `return 0`），那一轮实际吐多少就跟这一页显示的设定对不上了。
+  return (raw > 0) ? raw : DEFAULT_MAXTOK;
+}
+
+(function initMaxtok() {
+  const el = document.getElementById("maxtok");
+  let saved = NaN;
+  try { saved = parseInt(localStorage.getItem(MAXTOK_KEY), 10); }
+  catch (e) { /* 隐私模式 / 禁用 storage：用默认值就好，别让整页脚本挂在这儿 */ }
+  el.value = (saved > 0) ? saved : DEFAULT_MAXTOK;
+  // 回写一次生效值：输入框里显示的数必须就是真发出去的数，否则"我明明设了 2000"会变成
+  // 一场查不出原因的罗生门（比如粘进来个 "2,000"，parseInt 只认前面那个 2）
+  el.addEventListener("change", function () {
+    el.value = maxtok();
+    try { localStorage.setItem(MAXTOK_KEY, String(el.value)); } catch (e) {}
+  });
+})();
+
+// 这四问是**四个面板各自的第一问**。它们相同也没关系——四路是四段对话这件事
+// 由显式身份（`web-1`..`web-4`，见 streamChat）保证，不再靠"问题不一样"来区分。
+// （v1.9 之前靠内容区分：网关按 `system + 首问` 认对话，两路问同一句话就会被当成
+// 同一段对话、落到同一个会话上排队——那是"轮流"，不是并发，而且答案全对、看不出来。）
+//
+// 为什么默认问题这么"机械"：这种列举型任务模型会**直接开始输出**，不会先写一大段
+// 思考过程。换成"介绍一下杭州"这类需要组织语言的问题，实测在关思考的软开关下
+// 仍会吐 <think>，而且常常在 think 段里就被 max_tokens 截断——网关此时按设计
+// **原样吐出**（宁可露标签也不静默吞内容），投影出来就是满屏 "Analyze the Request"。
+// 演示时当然可以随便问，只是默认这四问是挑过的。
+// 四个都挑过：实测 150~190 tok、13~17 秒、**都不吐 <think>**。时长接近是有意的——
+// 四路里最短的那路一下线，屏幕上就只剩三行在动，"四路同时"的画面只维持很短一段。
+const DEFAULT_Q = [
+  "List the numbers from 1 to 40 separated by commas.",
+  "List the multiples of 5 from 5 to 200 separated by commas.",
+  "Count down from 50 to 1 separated by commas.",
+  "List the even numbers from 2 to 80 separated by commas.",
+];
+
+const panels = [];
+let lastSingleRate = null;     // 单路基线（只有一路在跑时记下来）
+
+// ---------- 窗口数上限：由**后端的会话数**决定，不是写死的 4 ----------
+//
+// 为什么上限必须问后端：KV 在 session_init 时按"每路满上下文"一次性预分配，所以
+// ctx 越大每路越贵、每卡能开的窗口越少——32K 导出实测每路 406.7 MB/卡，每卡只够 2 路
+// （再多就是 `rknn3_session_init` 分配失败，端点不应答，**要把板卡重启**）。
+// 所以这一页不许自己编一个数：`/health` 的 `sessions` 是后端真开出来的会话数，
+// `ctx_size` 是它的上下文长度。运维用 NSESSION=2 起、页面就最多 2 个窗口；
+// 换成 8K 那份导出起 NSESSION=4，这里就自动变回 4 个。
+let MAX_SESSIONS = 4;          // 兜底：读不到 /health 时按老行为（4 路）
+let CTX_SIZE = null;           // 后端命令行里的 --ctx-size（读不到就不显示这一格）
+let capKnown = false;          // 是否真读到了后端容量（读不到时容量条要说清楚）
+let nextUid = 1;               // 单调递增，**绝不复用**，理由见 newConvId()
+
+// 窗口身份 `web-<n>` 必须是**一次性**的。删掉窗口 2 再加一个，如果新窗口又叫 `web-2`，
+// 网关会把它当成刚才那段对话（同一个 key）——新窗口的第一个问题会命中旧对话的 KV、
+// 还接着旧历史，现场看着就是"删了没删掉"。序号可以重排，身份不行。
+function newConvId() { return "web-" + (nextUid++); }
+
+// 面板显示号（"面板 3"）在增删之后**重排**，但对话身份（convId）不动。
+// 序号是给眼睛看的，身份是给网关认对话的，两者一旦绑在一起，删掉中间那个窗口就会
+// 让后面几格全都"换了一段对话"（KV 复用直接没了，还看不出来）。
+function renumber() {
+  panels.forEach(function (p, i) { p.name.textContent = "面板 " + (i + 1); });
+}
+
+// 容量条。三件事一起说：上下文多长、后端开了几个会话、现在开了几个窗口。
+// **一直显示**，因为它回答的是"为什么我只能开这么几个窗口"——这个问题在看演示的
+// 每一秒都存在，不能等到没结果的时候才看见。
+function renderCap() {
+  const n = panels.length;
+  const el = document.getElementById("cap");
+  const parts = [];
+  parts.push("上下文 <b>" + (CTX_SIZE === null ? "?" : CTX_SIZE.toLocaleString()) + "</b>");
+  parts.push("后端会话 <b>" + MAX_SESSIONS + "</b>");
+  parts.push("窗口 <b>" + n + "/" + MAX_SESSIONS + "</b>");
+  if (!capKnown) { parts.push("（读不到 /health，按默认值显示）"); }
+  else if (n > MAX_SESSIONS) {
+    parts.push("窗口比后端会话多，多出来的只会排队，不是并发");
+  } else if (n === MAX_SESSIONS && MAX_SESSIONS > 1) {
+    parts.push(MAX_SESSIONS + " 路并发");
+  }
+  el.innerHTML = parts.join(" · ");
+  el.className = "capline" + (n > MAX_SESSIONS ? " over" : "");
+
+  const btn = document.getElementById("addwin");
+  const full = n >= MAX_SESSIONS;
+  btn.disabled = full;
+  btn.title = full
+    ? ("已到上限：后端只开了 " + MAX_SESSIONS + " 个会话"
+       + (CTX_SIZE === null ? "" : "（上下文 " + CTX_SIZE.toLocaleString() + " 时每路 KV 按满上下文预分配）")
+       + "。要更多窗口就得用更小的上下文导出、或者改用更少的窗口数重启后端。")
+    : "新增一个对话窗口";
+
+  // 「②」的文案跟着窗口数走（以前写死"4 路"，窗口变成 2 个之后就成了假话）
+  document.getElementById("all").textContent = "② " + n + " 路同时提问";
+}
+
+// ---------- 资源观测条（GET /v1/system，每 2s） ----------
+//
+// 这条上的数字有两半、来源和可信度都不一样，屏幕上必须分开说：
+//   · RK3588 那一半是**这一秒现读的**（/proc/stat、/proc/meminfo、thermal_zone*，
+//     由网关在读；页面只是显示）；
+//   · RK1828 那一半来自后端的 STAT 帧——一包原子量，带"多久之前采的"（stats_age_s）。
+// 还有两件最容易被读歪的事，写在条子上而不是只写在文档里：
+//   · **NPU 利用率是算出来的**（卡级忙时 ÷ 墙钟差），SDK 的查询枚举里根本没有利用率；
+//   · **两半的温度来路完全不同**（2026-09-20 补齐）。RK3588 那七个热区是网关现读
+//     `/sys/class/thermal/thermal_zone*`；四张卡的结温**主机侧确实没有**（它们是 PCIe
+//     设备、驱动 rkep，`/sys/class/hwmon` 下那几个读数全是 RK3588 自己的），
+//     唯一的来路是板上一个以 root 跑的采集服务每 5 秒跑一次 `rknn-smi info -t temp`
+//     写进 `/run/rknn-temp.json`（`rknn_smi_temp.py` + `rknn-temp.service`）。
+//     所以卡温**带一个「多少秒前」**，而热区没有——前者是别人采好放在那儿的，
+//     后者是这一秒读的。这句"来路不同"必须写在页面上，因为它决定了两半的可信度。
+// 轮询节流：**这是这一页对板卡唯一的常态负载**，所以分两档——有人生成时 2s（这会儿要看
+// 的是"卡忙起来没有"），待机时 6s（这时真正会变的只有温度和内存）。切到后台整块停掉
+// （visibilitychange，见文件末尾），切回来立刻补一次。
+// 板上这一拍的成本：网关读十几个 /proc、/sys 文件 + 一次 STAT 往返。所以两边都做了节制：
+// 网关侧有 1 秒的快照缓存（N 个人开着页面也只采一次），页面侧拿到的还是同一份 doc 时
+// **连 DOM 都不重写**（见 refreshSystem）。
+const SYS_POLL_BUSY_MS = 2000;
+const SYS_POLL_IDLE_MS = 6000;
+const SYS_STALE_S = 6;      // 快照超过这么多秒就当场标旧（后端不答了）
+// 卡温那一份（/run/rknn-temp.json）是另一个进程写的，节奏由它定：采集服务 5 秒一轮，
+// 所以"还新鲜"的界线要比 SYS_STALE_S 宽——20s = 连丢四轮才当场标旧。**两个阈值必须
+// 分开**：拿 6s 去量一份 5s 一写的文件，屏幕上会有一大半时间是黄的，看着像坏了。
+const TEMP_STALE_S = 20;
+
+let sysOn = false;
+let sysTimer = null;
+let sysSeq = 0;             // 请求序号：晚到的旧响应不许覆盖新的一帧
+let sysLastTs = null;       // 上一份**画到屏幕上**的 doc 的时间戳（同一份就不重画）
+let sysRenders = 0;         // 画过几次（只给检查用："同一份 doc 不重画"要能被验到）
+
+// 读不到就返回 null，由调用点决定怎么显示。**不能返回 0**：内存 0 GB 和"读不到"
+// 在屏幕上必须是两句话。
+function fmtBytes(v) {
+  if (typeof v !== "number" || !isFinite(v) || v <= 0) { return null; }
+  if (v >= 1073741824) { return (v / 1073741824).toFixed(1) + " GB"; }
+  return Math.round(v / 1048576) + " MB";
+}
+
+// **读不到显示 "—"，不是 "0%"**。刚打开页面的那一瞬间 NPU 利用率本来就没有值
+// （要两次采样才有差值），显示 0% 等于告诉人"板卡闲着"；CPU 同理。
+function fmtPct(v, digits) {
+  if (typeof v !== "number" || !isFinite(v)) { return "—"; }
+  return v.toFixed(digits === undefined ? 0 : digits) + "%";
+}
+
+// 温度和 fmtPct 是同一条规矩，而且**温度这里更要紧**：`null` / 缺字段画 "—"，
+// **绝不当成 0°**——0° 在屏幕上是一句肯定的假话（"这里凉快"），而 "—" 是"没读到"。
+// 取整是因为 0.1° 的差别看不出来，而带小数点会让七格每 2 秒一起抖。
+function fmtTemp(c) {
+  if (typeof c !== "number" || !isFinite(c)) { return "—"; }
+  return c.toFixed(0) + "°";
+}
+
+// 温度的颜色档。两个调用点的阈值不一样，所以做成带参数的：热区 ≥65 黄 / ≥80 红，
+// 芯片结温 ≥75 / ≥85（结温是这张卡自己最热的那个点，比 SoC 里某个采样点更值得早报）。
+function tempCls(c, warn, crit) {
+  if (typeof c !== "number" || !isFinite(c)) { return ""; }
+  return (c >= crit) ? "crit" : ((c >= warn) ? "warn" : "");
+}
+
+function fmtDur(s) {
+  if (typeof s !== "number" || !isFinite(s) || s < 0) { return "—"; }
+  if (s < 60) { return Math.round(s) + "s"; }
+  const m = Math.floor(s / 60);
+  if (m < 60) { return m + "m"; }
+  return Math.floor(m / 60) + "h" + (m % 60) + "m";
+}
+
+function bar(v, warn, crit) {
+  const has = (typeof v === "number" && isFinite(v));
+  const w = has ? Math.max(0, Math.min(100, v)) : 0;
+  const cls = !has ? "" : (v >= crit ? " crit" : (v >= warn ? " warn" : ""));
+  return '<span class="bar' + cls + '"><i style="width:' + w.toFixed(1) + '%"></i></span>';
+}
+
+// 8 个核一根小柱。高度就是占用率，0% 就是空的（不设最小高度——给 0% 留一根看得见的
+// "底座"就等于编了一个数）。读不到的那个核留空柱、靠 title 说清楚。
+function coresHtml(list) {
+  if (!list || !list.length) { return ""; }
+  return '<span class="cores">' + list.map(function (v) {
+    const has = (typeof v === "number" && isFinite(v));
+    const h = has ? Math.max(0, Math.min(100, v)) : 0;
+    return '<i title="' + (has ? h.toFixed(0) + "%" : "未读到") + '"><span style="height:' +
+           h.toFixed(0) + '%"></span></i>';
+  }).join("") + "</span>";
+}
+
+// 热区标签是 "soc-thermal" / "bigcore0-thermal" 这种。屏幕上用**缩写**，不是直接截断：
+// `bigcore0` 和 `bigcore1` 前六个字母一模一样，用 CSS 省略号截出来就是两个"bigcor…"，
+// 比缩写更难分（`big0` / `big1` 至少一眼分得开）。**全长名字进每一格的 title**，
+// 鼠标停上去就是后端给的原始字符串。认不出来的标签退回"去掉 -thermal"，这样将来板上
+// 多一个热区也不会变成空白格。
+const THERM_ALIAS = {
+  "soc-thermal": "soc", "bigcore0-thermal": "big0", "bigcore1-thermal": "big1",
+  "littlecore-thermal": "little", "center-thermal": "center",
+  "gpu-thermal": "gpu", "npu-thermal": "npu"
+};
+
+function shortLabel(s) {
+  const k = String(s || "");
+  return THERM_ALIAS[k] || k.replace(/-thermal$/, "");
+}
+
+// 七个热区**全画出来**（2026-09-20 改）。原来只画最热的 3 个、剩下 4 个收成一个 "+4"，
+// 用户的原话是"没有用合适的方法展示出来"——那个 "+4" 只是个计数，被收起来的四个热区
+// 在屏幕上**没有任何入口**（title 要鼠标停上去才看得到，触屏上根本点不出来）。缩写
+// 之后最长的一格只有 6 个字母，七格全画出来只多占一两行（`· soc 30°` 一格 ~55px）。
+//
+// **顺序固定：就按后端给的 zone 顺序，不再按温度排**（和改之前相反，是刻意的）。
+// 这一块每 2 秒重画一次，按温度排意味着"谁最热谁跳到最前面"——两个热区温度交叉时
+// 整行来回重排，屏幕上是一跳一跳的。固定顺序之后位置永远不动、只有数字在变；
+// "哪里烫起来了"改由**颜色**回答（≥65 黄、≥80 红），扫一眼看得出来，还不用重排。
+function thermHtml(list) {
+  if (!list || !list.length) { return '<span class="m off">温度 —</span>'; }
+  const full = list.map(function (t) {
+    return String(t.label || "") + " " + fmtTemp(t.c);
+  }).join(" · ");
+  const cells = list.map(function (t, i) {
+    const c = t && t.c;
+    // 一格 = "· soc 30°"。`· ` 写在**后一格的开头**：折行时下一行以 "· " 起头，是列表的
+    // 常规长相。标签与数字之间那个空格是**字面空格**（不是 flex 的 gap——gap 是布局上
+    // 的空隙，复制下来会变成 "soc30°"，见 CSS 里 `.tl` 那条）。
+    return '<span class="ti" title="' + esc(String(t.label || "") + " " + fmtTemp(c)) + '">' +
+           (i ? "· " : "") +
+           '<span class="tl">' + esc(shortLabel(t.label)) + "</span> " +
+           '<b class="' + tempCls(c, 65, 80) + '">' + fmtTemp(c) + "</b>" +
+           (i < list.length - 1 ? "\u00a0" : "") + "</span>";
+  });
+  // 分隔符 `· ` 同样是**真文本、不是 CSS 生成的**（`::after` 那种写法复制不出来、读屏
+  // 软件也时常不念：屏幕上明明是"soc 30° · big0 30°"、复制下来却是"soc 30°big0 30°"）。
+  // 每格尾巴那个**不折空格**在源码里写转义 `\u00a0`，**别把那个字符直接敲进来**：
+  // 它和普通空格长得一模一样，下一个人会当空格删掉，屏幕上的 "soc 30° · big0 30°"
+  // 就悄悄变成 "soc 30°· big0 30°"；普通空格还有一个毛病——它会落在折行点上被吃掉，
+  // 贴成同一个样子。最后一格不要尾巴，否则行尾多一个空格。
+  return '<span class="m therm" title="全部热区：' + esc(full) + '">' +
+         cells.join("") + "</span>";
+}
+
+// 一样东西 = 一块。**块内一行一个指标**（标签 + 数 + 条子），不是把四张卡和主机状态
+// 全塞进一条横向长行：前者自己往下长、永远不会互相挤；后者每加一个字段就要重新分配
+// 那几个 px，四个核柱 + 四张卡一摆上就成了一张发票。
+function sRow(lab, value, extra) {
+  // 标签与值之间那个**字面空格**不能省：`.srow` 是 flex，纯空白节点不占位（视觉上无影响），
+  // 但去掉标签之后文本才是「CPU 42%」而不是「CPU42%」——复制出来和读屏软件读到的都是前者。
+  return '<div class="srow">' + (lab ? '<span class="lab">' + lab + "</span> " : "") +
+         value + (extra ? " " + extra : "") + "</div>";
+}
+
+function sBlock(head, body) {
+  return '<div class="sblock"><div class="bhead">' + head + "</div>" + body + "</div>";
+}
+
+function renderSysErr(msg) {
+  const el = document.getElementById("sys");
+  if (!el) { return; }
+  el.innerHTML = '<div class="shead"><h2>资源使用</h2></div>' +
+    '<span class="off">读不到 /v1/system（' + esc(msg) +
+    "）——网关没起、或者这一页是当本地文件打开的</span>";
+}
+
+// 把一份 /v1/system 画出来。**整块重写**：这样一个数字动一下整块就跟着重排，
+// 不会出现"一半是新的、一半还是上一次的"。
+function renderSys(d) {
+  const el = document.getElementById("sys");
+  if (!el) { return; }
+  sysRenders++;
+  // 标题上的 title 是**给鼠标的**（2026-09-20 用户要求页面简洁）：这几句说的是屏幕上
+  // 看不出来的事——两个百分数不是硬件读数、两半温度来路不同。写出来的话底部要多占两行，
+  // 而那两行本来就在 `max-height` 的边缘上（1366 上多一行就要挤掉别的）。
+  const head = '<div class="shead"><h2 title="' + esc(
+    "刷新：生成中每 2 秒、待机 6 秒，页面切到后台就停。" +
+    "RK3588 半边（CPU / 内存 / 热区 / 负载）是这一秒从 /proc、/sys 现读的；" +
+    "四张卡的 NPU 与内存来自后端 STAT 帧，NPU 是卡级忙时占比（累计推理耗时 ÷ 墙钟，" +
+    "SDK 没有利用率查询接口），不是硬件读数；结温由板上采集服务每 5 秒跑一次 rknn-smi " +
+    "取出来，所以带「多少秒前」——主机侧的 hwmon / thermal_zone 里没有卡温") +
+    '">资源使用</h2></div>';
+  if (!d) {
+    el.innerHTML = head + '<span class="off">正在读取…</span>';
+    return;
+  }
+  sysLastTs = d.ts;   // 记住画下去的这一份：下一拍若还是同一个 ts，连 DOM 都不动
+  const host = d.host || {}, cpu = host.cpu || {}, mem = host.mem || {};
+  const npu = d.npu || {}, be = d.backend || {}, gw = d.gateway || {};
+  const blocks = [];
+
+  // ---- RK3588：本机现读 ----
+  const memTotal = fmtBytes(mem.total);
+  const memUsed = fmtBytes(mem.used);
+  let hostBody =
+    sRow("CPU", "<b>" + fmtPct(cpu.pct) + "</b>", coresHtml(cpu.per_core)) +
+    sRow("内存", "<b>" + fmtPct(mem.used_pct) + "</b>", bar(mem.used_pct, 80, 92) +
+      // `.m`（不折）在这一段上是必须的，见 CSS 里 `.srow` 那条：不加它这一行会在
+      // "5.7 GB /"、"15.6"、"GB" 之间断成四行。
+      (memTotal && memUsed ? ' <span class="m dim2">' + memUsed + " / " + memTotal + "</span>" : ""));
+  const load = (cpu.loadavg && cpu.loadavg.length) ? cpu.loadavg[0].toFixed(2) : null;
+  const up = (typeof host.uptime_s === "number") ? fmtDur(host.uptime_s) : null;
+  if (load || up) {
+    hostBody += sRow("负载", load ? "<b>" + load + "</b>" : '<span class="off">—</span>',
+                     up ? '<span class="m dim2">· 开机 ' + up + "</span>" : "");
+  }
+  blocks.push(sBlock('<span class="tag">RK3588</span> <span class="dim2">本机现读</span>',
+                     hostBody));
+  // 热区单独一块：它是"哪里烫起来了"这一个问题的答案，挤在别的数里就没人看。
+  blocks.push(sBlock('<span class="tag">RK3588 热区</span>',
+                     '<div class="srow">' + thermHtml(host.thermal) + "</div>"));
+
+  // ---- 服务：后端活着吗、会话占了几个、有没有人在排队、这份数据多旧 ----
+  const alive = (be.alive !== false);
+  const age = be.stats_age_s;
+  const ageNum = (typeof age === "number") ? age : null;
+  // **"一次都没采到"和"采过但很旧"是两回事**，不能合成一句话：前者是页面刚打开、
+  // 第一包还没回来（正常）；后者是后端不答了（有事）。所以只有后者才加警示。
+  const stale = (ageNum !== null && ageNum > SYS_STALE_S);
+  let svc =
+    sRow("后端", '<b class="' + (alive ? "" : "crit") + '">' +
+                 (alive ? "正常" : "已退出") + "</b>") +
+    sRow("会话", "<b>" + (gw.bound == null ? "—" : gw.bound) + " / " +
+                 (be.sessions == null ? "—" : be.sessions) + "</b>") +
+    sRow("排队", '<b class="' + ((gw.waiting > 0) ? "warn" : "") + '">' +
+                 (gw.waiting == null ? "—" : gw.waiting) + "</b>") +
+    sRow("数据", '<b class="' + (stale ? "warn" : "") + '">' +
+                 (ageNum === null ? (alive ? "还没采到" : "—") : ageNum.toFixed(1) + "s 前") +
+                 "</b>" + (stale ? "（后端没在答）" : ""));
+  if (typeof gw.uptime_s === "number") {
+    svc += sRow("网关", '<span class="dim2">已跑 ' + fmtDur(gw.uptime_s) + "</span>");
+  }
+  // 五行排成两列（见 CSS 里 `.svc` 那段）：这一块原来是七块里最高的，等高之后整条线的高度
+  // 就由它决定；两列之后它与四张卡一样高。**顺序是"先左右后上下"**（后端/会话 一行，
+  // 排队/数据 一行，网关 单独一行），所以屏幕上从左到右、从上到下读仍是原顺序。
+  blocks.push(sBlock('<span class="tag">服务</span>', '<div class="svc">' + svc + "</div>"));
+
+  // ---- RK1828：后端 STAT 帧。**一张卡一块**（原来四张卡挤在同一行里）----
+  // 单开一个数组而不是接在 blocks 后面：没卡的时候那一块"读不到"也要画出来，
+  // 靠 slice 切的话它正好会被切掉。
+  const cardBlocks = [];
+  const cards = npu.cards || [];
+  // 卡温的年龄**是那份文件的属性、不是某一张卡的**（四张卡是同一次采样写下来的），
+  // 所以在循环外面算一次；抄进循环里就成了"它们各自会变旧"，是个不存在的东西。
+  const tAgeNum = (typeof npu.temp_age_s === "number") ? npu.temp_age_s : null;
+  const tStale = (tAgeNum !== null && tAgeNum > TEMP_STALE_S);
+  cards.forEach(function (c, i) {
+    const nm = String(c.name || ("#" + i));
+    // 后端的 stage 名就是 `stage0`..`stage3`（一张卡一个）。页面上按卡号写更短。
+    const m = /^stage(\d+)$/.exec(nm);
+    // 块头里那个空格同样不能省（`#0` 和 `ctx` 之间）：去掉标签后就是「#0 ctx 32768」。
+    const bhead = '<span class="tag">RK1828</span> ' +
+      '<b title="' + esc(nm + " 上下文 " + String(c.ctx_len)) + '">' +
+      esc(m ? "#" + m[1] : nm) + "</b> " +
+      '<span class="dim2">ctx ' + esc(String(c.ctx_len)) + "</span>";
+    let body =
+      sRow("NPU", tip("<b>" + fmtPct(c.busy_pct) + "</b>",
+        "这张卡的 NPU 忙时占比 = 累计推理耗时 ÷ 墙钟，是算出来的——"
+        + "SDK 没有利用率查询接口，不是硬件读数"), bar(c.busy_pct, 70, 90)) +
+      // 字节数收进 title（一块里写两个字节串会把这一行挤到换行）。title 里也顺带说清
+      // 91% 是**谁**的占比——整卡各 node 之和，不是 dev_mem.sys_*（那是主机侧的小块
+      // 内存，实测只有 ~19 MB，拿它当整卡内存会显示成"每卡 19 MB"，而 rknn-smi 报 93%）。
+      sRow("内存", '<span class="m" title="' + esc("整卡 " + (fmtBytes(c.mem_used) || "—") +
+        " / " + (fmtBytes(c.mem_total) || "—") + "（各 node 之和）" +
+        (c.node_num ? "，" + c.node_num + " 个 node" : "")) + '"><b>' +
+        fmtPct(c.mem_used_pct) + "</b></span>", bar(c.mem_used_pct, 85, 95));
+    // 结温（2026-09-20 加）。**四张卡都画这一行**，没有读数就画 "—"、**不当 0°**：
+    // 少了这一行的话，采集服务没跑的时候这一整行会消失，四张卡的高度跟着变，
+    // 屏幕上就是右边一栏在跳。
+    // 那个「多少秒前」是**必须的**：这个数不是这一秒读的，是板上另一个进程每 5 秒
+    // 采一次放在文件里的（年龄见循环外面那两个 const）。不写年龄，屏幕上一个 30 秒前的
+    // 41° 和一个刚采的 41° 长得一模一样——而前者很可能正是一张已经热起来的卡。
+    body += sRow("温度", tip('<b class="' + tempCls(c.temp_c, 75, 85) + '">' +
+                        fmtTemp(c.temp_c) + "</b>",
+                        "RK1828 结温；由板上采集服务每 5 秒跑一次 rknn-smi 取出来，"
+                        + "不是这一秒现读的。采集服务没装/没跑时画「—」，不会画 0°"),
+                 (tAgeNum === null) ? "" :
+                   '<span class="m ' + (tStale ? "warn" : "dim2") + '">· ' +
+                   (tStale ? "已停 " : "") + tAgeNum.toFixed(1) + "s 前</span>");
+    // `> 0` 那一条是必须的：0 表示**后端一次都没采到**（查询失败），不是"还剩 0 字节"。
+    // 后面那个 `|| "—"` 是第二道保险——fmtBytes 读不到时返回 null，少了它屏幕上会
+    // 印出字面的 "node null"。
+    if (typeof c.node_min_free === "number" && c.node_min_free > 0) {
+      body += sRow("node", '<span class="m dim2" title="全卡最紧那个 node 还剩多少——' +
+        '这是最先撞墙的一格">' + (fmtBytes(c.node_min_free) || "—") + "</span>");
+    }
+    // 块头和第一行之间的那个空格：`.bhead` 是块级元素，多这一个空格在屏幕上不占位，
+    // 但去掉标签之后就是「… ctx 32768 NPU 55%」而不是「… ctx 32768NPU 55%」。
+    cardBlocks.push(sBlock(bhead + " ", body));
+  });
+  if (!cardBlocks.length) {
+    cardBlocks.push(sBlock('<span class="tag">RK1828</span> ',
+                           '<span class="off">读不到（后端还没答 STAT）</span>'));
+  }
+
+  // 两块网格、**左右并排**（2026-09-20 改）：左边是"这台机器（RK3588）+ 服务"，
+  // 右边是"四张卡"。分成两块网格是刻意的——**四张卡要一眼数得出来是四张**，
+  // 混在一堆块里数不出来（并排不影响这一条，四张卡仍是四个独立的块）。
+  // 为什么从"上下两行"改成"左右两栏"：上下两行时这一块要 376px 高（两行块子 292 + 表头
+  // 与说明 84），在 1080p 上占掉 37%、矮屏上快到一半，而用户要的是底部 1/5~1/4。
+  // 并排之后高度是 `max(左边, 右边)` 而不是"两者相加"：实测 376 → 250px，
+  // 1080p 上正好 1/4、1440p 上 1/5。**一块内容都没少、也没挤紧**，只是不再白占一行。
+  el.innerHTML = head +
+    '<div class="swrap">' +
+    '<div class="sgrid sg-host">' + blocks.join("") + "</div>" +
+    '<div class="sgrid sg-cards">' + cardBlocks.join("") + "</div>" +
+    "</div>";
+}
+
+async function refreshSystem() {
+  const mine = ++sysSeq;
+  let doc;
+  try {
+    const r = await fetch(API + "/v1/system");
+    if (!r.ok) { throw new Error("HTTP " + r.status); }
+    doc = await r.json();
+  } catch (e) {
+    // 观测端点拿不到**不该影响这一页的任何功能**：聊天照跑，只是这一条说明白。
+    if (mine === sysSeq) { renderSysErr(String((e && e.message) || e)); }
+    return;
+  }
+  if (mine !== sysSeq) { return; }   // 已经有更新的一帧在路上了，这份是旧的，丢掉
+  // 网关侧有 1 秒的快照缓存（几个人同时开着页面也只采一次），所以连着两拍很可能拿到
+  // **同一份 doc**。这时候连 DOM 都不动：innerHTML 重写会让整块重新排版一次，
+  // 而数字一个都没变——白花的这一次排版在板卡那边看不到，在看页面这台机器上是要出钱的。
+  // `doc.ts != null` 那一条是必须的：万一碰上不带 ts 的应答（老网关、或者有人自己写了个
+  // 转发），`undefined === undefined` 会让这一页**从此再也不刷新**——屏幕上就是数字冻在
+  // 打开那一帧，看着还挺正常。宁可不省这一次重画。
+  if (doc && doc.ts != null && doc.ts === sysLastTs) { return; }
+  renderSys(doc);
+}
+
+// 有人在生成就快一点，闲着就慢一点。**这不是省流量，是省板卡**：这一块的每一拍都要
+// 网关读一遍 /proc、/sys，再向后端要一次 STAT；而待机时真正会变的只有温度和内存。
+function sysIntervalMs() {
+  return panels.some(function (p) { return p.streaming; })
+    ? SYS_POLL_BUSY_MS : SYS_POLL_IDLE_MS;
+}
+
+function sysTick() {
+  sysTimer = null;
+  if (!sysOn) { return; }
+  // 自排下一拍（而不是 setInterval）：串行，慢响应不会堆起来把请求叠成一串。
+  refreshSystem().then(function () {
+    if (sysOn) { sysTimer = setTimeout(sysTick, sysIntervalMs()); }
+  });
+}
+
+function startSysPoll() {
+  if (sysOn) { return; }
+  sysOn = true;
+  sysTick();
+}
+
+function stopSysPoll() {
+  sysOn = false;
+  if (sysTimer) { clearTimeout(sysTimer); sysTimer = null; }
+}
+
+// 某一轮刚开始生成时立刻补一拍：不补的话，待机档最长要等 6 秒才看到卡忙起来——
+// 而"点了②之后卡是不是真的忙了"恰恰是演示时最想看的那一帧。
+function sysWake() {
+  if (!sysOn) { return; }
+  if (sysTimer) { clearTimeout(sysTimer); }
+  sysTimer = setTimeout(sysTick, 0);
+}
+
+// 读后端的容量。**失败不抛**：页面可能被当本地文件打开（那时没有同源后端），
+// 或者网关还没起来——这两种情况下都用兜底值继续，只是容量条上说明白。
+async function refreshHealth() {
+  try {
+    const r = await fetch(API + "/health");
+    if (!r.ok) { return; }
+    const h = await r.json();
+    if (typeof h.sessions === "number" && h.sessions > 0) { MAX_SESSIONS = h.sessions; }
+    if (typeof h.ctx_size === "number") { CTX_SIZE = h.ctx_size; }
+    capKnown = true;
+  } catch (e) {
+    /* 保持上一次的值（首次就是兜底值） */
+  }
+  renderCap();
+}
+
+function makePanel() {
+  const el = document.createElement("div");
+  el.className = "panel";
+  el.innerHTML =
+    '<div class="phead"><span class="dot"></span><span class="name" data-role="name"></span>' +
+    '<span class="hint" data-role="sess"></span>' +
+    '<span class="perf" data-role="perf"></span>' +
+    '<button class="close" data-role="close" title="关闭这个窗口（会话当场交还）" ' +
+    'aria-label="关闭窗口">×</button></div>' +
+    '<div class="log" data-role="log"></div>' +
+    '<div class="stat" data-role="stat"></div>' +
+    '<div class="pfoot"><div class="inbox">' +
+    '<textarea data-role="in" rows="1" placeholder="输入问题，Enter 发送 · Shift+Enter 换行"></textarea>' +
+    '<button data-role="pause" class="pause" title="暂停生成" aria-label="暂停">暂停</button>' +
+    '<button data-role="go" class="send" title="发送（Enter）" aria-label="发送">' +
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" ' +
+    'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M4 12h14M12 6l6 6-6 6"/></svg></button>' +
+    '</div></div>';
+
+  const p = {
+    el: el,
+    convId: newConvId(),     // 这一格的对话身份，**从此刻起不再变**
+    name: el.querySelector('[data-role=name]'),
+    log: el.querySelector('[data-role=log]'),
+    stat: el.querySelector('[data-role=stat]'),
+    sess: el.querySelector('[data-role=sess]'),
+    perf: el.querySelector('[data-role=perf]'),
+    input: el.querySelector('[data-role=in]'),
+    go: el.querySelector('[data-role=go]'),
+    pause: el.querySelector('[data-role=pause]'),
+    close: el.querySelector('[data-role=close]'),
+    dot: el.querySelector('.dot'),
+    messages: [],            // 这一路自己的对话历史 —— 多轮就靠它，也是 KV 复用的前提
+    streaming: false,
+    paused: false,           // 上一轮被暂停、半截答案还留在气泡里（等「继续」或「问别的」）
+    requestId: null,         // 当前/最近一轮的 rid（后端回在 X-Request-Id 头里）
+    bubble: null,            // 正在写的助手气泡（「继续」要接着往里写）
+    kv: "",
+    ttft: null,              // 首字延迟（第一个增量到手的时间），性能小字要它
+  };
+  p.input.addEventListener("input", function () { grow(p.input); });
+  p.input.addEventListener("keydown", function (e) {
+    // Enter 发送、**Shift+Enter 换行**。单行 input 时回车只有发送一个意思，改成
+    // textarea 之后回车默认是换行（不拦的话按回车什么都不发生），所以必须显式分流。
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();     // 不然发送的同时还往框里插一个换行
+      send(p);
+    }
+  });
+  p.go.addEventListener("click", function () { send(p); });
+  // 同一个按钮两种身份：生成中是「暂停」，暂停后（半截答案还在）是「继续」。
+  // 分发必须按状态做——只绑 pauseTurn 的话，暂停后点它会被 !streaming 挡掉，
+  // 「继续」形同虚设（2026-09-21 用户报的正是这个）。
+  p.pause.addEventListener("click", function () { togglePause(p); });
+  p.close.addEventListener("click", function () { removePanel(p); });
+  return p;
+}
+
+function addPanel() {
+  if (panels.length >= MAX_SESSIONS) { return null; }
+  const p = makePanel();
+  panels.push(p);
+  document.getElementById("grid").appendChild(p.el);
+  p.input.value = DEFAULT_Q[(panels.length - 1) % DEFAULT_Q.length];
+  grow(p.input);
+  render(p);
+  renumber();
+  renderCap();
+  updateGlobal();
+  return p;
+}
+
+function removePanel(p) {
+  // 正在生成的不许删：它多半正占着会话，DOM 一没，那一路的结果回来就没处写了。
+  if (p.streaming) { return false; }
+  const i = panels.indexOf(p);
+  if (i < 0) { return false; }
+  // 至少留一个。全删光之后这一页就只剩一个"＋"，连"单路基线"都没法量了。
+  if (panels.length <= 1) { return false; }
+  panels.splice(i, 1);
+  // 历史跟着 DOM 一起没了，会话留着只是占着不放——**当场交还**。网关只排队不抢占，
+  // 不还的话新窗口/新客户端要一直等到 IDLE_TTL（默认 300s）超时才有位置，
+  // 而那几分钟里屏幕上什么异常都看不出来。
+  closeConv(p.convId);
+  if (p.el.remove) { p.el.remove(); }
+  else if (p.el.parentNode && p.el.parentNode.removeChild) { p.el.parentNode.removeChild(p.el); }
+  renumber();
+  renderCap();
+  updateGlobal();
+  return true;
+}
+
+// 先建几个窗口：最多 4 个（屏幕摆得下），且不超过后端会话数。
+// 32K 那份导出只够 2 路，于是这里就建 2 个——**不是页面小气，是板卡只有这点内存**。
+const MAX_PANELS_ON_SCREEN = 4;
+
+function buildPanels() {
+  const want = Math.min(MAX_PANELS_ON_SCREEN, MAX_SESSIONS);
+  for (let i = 0; i < want; i++) { addPanel(); }
+}
+
+function addMsg(p, kind, who, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + kind;
+  const w = document.createElement("span");
+  w.className = "who";
+  w.textContent = who;
+  const b = document.createElement("span");
+  b.className = "body";
+  b.textContent = text;
+  d.appendChild(w);
+  d.appendChild(b);
+  p.log.appendChild(d);
+  p.log.scrollTop = p.log.scrollHeight;
+  return b;
+}
+
+// 只负责"外观状态"。**不要在这里碰 p.stat**：send() 的 finally 会调 render()，
+// 顺手把统计行也重写的话，流结束时刚算好的 tok/s 会被当场抹掉（踩过）。
+function render(p) {
+  p.el.classList.toggle("active", p.streaming);
+  p.dot.classList.toggle("on", p.streaming);
+  p.go.disabled = p.streaming;
+  // 生成中显示「暂停」；暂停后（半截答案还在）显示「继续」；平时都不显示。
+  p.pause.classList.toggle("show", p.streaming || p.paused);
+  p.pause.textContent = (p.paused && !p.streaming) ? "继续" : "暂停";
+}
+
+// 统一转义。这一页的统计行有几处是**拼 HTML** 的（速率要加粗），而错误信息来自网关
+// 返回的响应体——不转义就等于把服务端文本当标记塞进 DOM。自己人打自己的板卡，风险
+// 不高，但"十处拼 HTML、一处忘了转义"正是这类问题最常见的形态，一开始就堵上更省事。
+// 给一格数据挂 tooltip：把说明放在**外层 span** 上，里面的 HTML 一个字节都不动。
+// 为什么不在 `<b>` 上直接加 title：检查里那几条颜色断言是拿 `<b class="crit">88°</b>`
+// **字面**比的（这一格什么颜色、度数对不对），多一个属性就全红了——而那些断言正是
+// 防"顺手复用热区阈值"的，不该为了加个提示就把它们改松。
+function tip(html, text) {
+  return '<span title="' + esc(text) + '">' + html + "</span>";
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+
+// 统计行**是 HTML**、不是纯文本：调用方要拼 <b> 把速率加粗。
+// 原来这里写的是 textContent —— 于是页面上直接印出字面的 `<b>11.63 tok/s</b>`，
+// 标签跟着数字一起显示了很久没人发现（看起来只是"没那么粗"，不像坏了）。
+function setStat(p, html) { p.stat.innerHTML = html; }
+
+// 顶部徽标：**只放一两个词的状态**，颜色由 class 决定（CSS 的 .badge.<state>）。
+// 字和色必须一起改 —— 只改字的话"生成中"和"待机"是同一个灰灯，隔着投影仪根本看不出
+// 区别，而"一眼看出板卡在不在跑"正是这个徽标存在的理由。
+// 逐个 remove 而**不是** remove("idle","busy",...)：桩 DOM 的 classList.remove 只认第一个
+// 参数，多传的会被静默丢掉，于是桩里绿、浏览器里绿、真跑起来是花的。
+function setStatus(state, text) {
+  const b = document.getElementById("status");
+  ["idle", "busy", "wait", "err"].forEach(function (c) { b.classList.remove(c); });
+  b.classList.add(state);
+  document.getElementById("gstats").textContent = text;
+}
+
+// 顶部那行汇总（基线 / 四路聚合）。空串 = 整行不占高度（CSS 的 .sumline:not(:empty)）。
+function setSum(html) { document.getElementById("gsum").innerHTML = html || ""; }
+
+// 面板头右侧的性能小字：TTFT + tok/s。**底部统计行看不见首字延迟**（它只有总耗时），
+// 而"要等多久才出第一个字"恰恰是给人看并发最直观的一个数，所以这两处不算重复：
+// 这里是**基准条**（首字延迟 / 速率），下面是**记账**（token 数、排队拆解、会话与 KV）。
+function setPerf(p, html) {
+  if (p.perf) { p.perf.innerHTML = html; }
+}
+
+// 多行输入框的高度自适应：先归零再按内容量一次，然后夹在上限里。
+// `typeof scrollHeight !== "number"` 那一句是给**桩 DOM**（page_check.js）留的：它没有排版，
+// 没有 scrollHeight。不挡的话那边会往 style.height 里写 "NaNpx" —— 不报错、但也没意义。
+function grow(el) {
+  if (!el || typeof el.scrollHeight !== "number") { return; }
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 120) + "px";
+  el.style.overflowY = el.scrollHeight > 120 ? "auto" : "hidden";
+}
+
+function parseKV(s) {
+  // 形如 session=2; reset=0; sent=118; base=248; full=366
+  const o = {};
+  (s || "").split(";").forEach(function (part) {
+    const kv = part.split("=");
+    if (kv.length === 2) { o[kv[0].trim()] = kv[1].trim(); }
+  });
+  return o;
+}
+
+// 一次流式对话的核心：发请求、按 SSE 逐块解析、把增量交给 onDelta。
+// 面板和"单路基线"共用它，免得解析逻辑写两份、改一处忘一处。
+//
+// convId 是**显式身份**（X-Conversation-Id），不是可有可无的装饰：不给身份时网关只能按
+// "system + 首问"的内容摘要认对话，这样造出来的对话**认不出也关不掉**（只能从 /v1/pool
+// 读原始 key 再关），会一直占着会话到 IDLE_TTL 超时。这一页四个面板本来就该是四段对话，
+// 给它一个稳定的名字，是谁、占着哪几个会话、要不要放掉，就都是明面上的事了。
+// onWait(elapsed)：**响应头还没回来**时每 200ms 叫一次。
+// 必须有它：响应头是在网关拿到会话之后才发的，所以"在队列里排队"这段时间里
+// `fetch` 还没 resolve、一个字节都没到——页面上只剩一个转圈，用户看到的就是
+// "NPU 明明没人用，我却在干等"（2026-09-18 就是这样报上来的）。有了这个回调，
+// 等待期间屏幕上写的就是"等待空闲会话 12.3s"，而不是沉默。
+async function streamChat(messages, onDelta, convId, onWait, body, onMeta) {
+  const t0 = performance.now();
+  let ntok = 0, nchunk = 0, answer = "";
+  const headers = { "Content-Type": "application/json" };
+  if (convId) { headers["X-Conversation-Id"] = convId; }
+  const tick = onWait
+    ? setInterval(function () { onWait((performance.now() - t0) / 1000); }, 200)
+    : null;
+  let res;
+  try {
+    res = await fetch(API + "/v1/chat/completions", {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(body || {
+        model: MODEL,
+        messages: messages,
+        max_tokens: maxtok(),
+        stream: true,
+        stream_options: { include_usage: true },
+        chat_template_kw: { enable_thinking: document.getElementById("think").checked },
+      }),
+    });
+  } finally {
+    // 头一到就停：接下来的时间就是真的在跑模型了，由 onDelta 那条线接管。
+    if (tick !== null) { clearInterval(tick); }
+  }
+  if (!res.ok) {
+    throw new Error("HTTP " + res.status + " " + (await res.text()).slice(0, 200));
+  }
+  // 自定义响应头能被 JS 读到，靠网关的 Access-Control-Expose-Headers
+  const kv = parseKV(res.headers.get("X-KV-Reuse") || "");
+  // 网关自己记的排队时长（秒）。拿它而不是上面那个 tick 的终值：网关是**真在队列里**
+  // 计时的一方，tick 还含了 TCP/浏览器那一小段。
+  const waited = Number(kv.wait || 0) || 0;
+  // 这一轮的 rid（后端回在 X-Request-Id 头里）。「暂停」要拿它去 POST /v1/stop，
+  // 所以必须在这里（body 还没开始读）就交出去，而不是等 streamChat 返回。
+  const rid = res.headers.get("X-Request-Id");
+  if (onMeta) { onMeta({ rid: rid, kv: kv, waited: waited }); }
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let finish = null;
+  for (;;) {
+    const r = await reader.read();
+    if (r.done) { break; }
+    buf += dec.decode(r.value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line.startsWith("data:")) { continue; }
+      const payload = line.slice(5).trim();
+      if (payload === "[DONE]") { continue; }
+      let d;
+      try { d = JSON.parse(payload); } catch (e) { continue; }
+      // 末尾那块带 usage（stream_options.include_usage），以它的 completion_tokens 为准：
+      // 自己数块数会把"块"当"token"，和板上的测量脚本口径对不上
+      if (d.usage && typeof d.usage.completion_tokens === "number") {
+        ntok = d.usage.completion_tokens;
+      }
+      const ch = d.choices && d.choices[0];
+      // finish_reason 必须在取 content **之前**读：带它的那一块 delta 是空的（只有
+      // `finish_reason` 有值），下面 `if (!piece) continue` 顺手就把它跳过去了——
+      // 放在后面写就是永远读不到，而且不报错、统计行一直不显示"触顶"。
+      if (ch && ch.finish_reason) { finish = ch.finish_reason; }
+      const piece = ch && ch.delta && ch.delta.content;
+      if (!piece) { continue; }
+      nchunk++;
+      answer += piece;
+      onDelta(answer, (performance.now() - t0) / 1000, nchunk);
+    }
+  }
+  const el = (performance.now() - t0) / 1000;
+  const tok = ntok || nchunk;          // usage 没到就退化成数出来的块数
+  return { tok: tok, el: el, rate: tok / el, text: answer, kv: kv, exact: !!ntok,
+           finish: finish, waited: waited, rid: rid };
+}
+
+// 问完了就主动把会话还回去（POST /v1/conversations/close）。
+// **这不是讲礼貌**：网关只排队、不抢占，一段"问一次就再也不问"的对话如果一直挂着身份，
+// 它占的会话就一直占着，直到 IDLE_TTL（默认 300 秒）超时——排队的人白等五分钟，
+// 而屏幕上一点异常都看不出来（排队在吞吐上是隐形的）。基线正是这种一次性对话。
+// 面板**不调它**：那四段对话留着，下一批就是它们的第二轮，KV 复用演示靠的就是这个。
+async function closeConv(convId) {
+  try {
+    await fetch(API + "/v1/conversations/close", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversation_id: convId }),
+    });
+  } catch (e) { /* 交还失败不影响演示：最坏就是退回"等 TTL 超时"的老行为 */ }
+}
+
+// 关页面 = 这次演示结束了，把当前**所有**窗口的身份都还回去（加基线那一个）。
+// 这里必须遍历 `panels` 而不是写死一串名字：窗口是可以增删的，写死的那几个名字
+// 在删过窗口之后就对不上了——对不上的后果是那段对话一直占到 IDLE_TTL 超时，
+// 后面来的人干等五分钟，而屏幕上一点异常都看不出来。
+// 用 `sendBeacon` 而**不是** `fetch`：页面正在卸载时 fetch 会被浏览器直接取消，
+// 这段代码就等于没写；sendBeacon 由浏览器代发，是 unload 里唯一靠得住的方式。
+// 只在关页面时还、不在面板跑完就还：同一页里那几段对话是要留着的（第二轮看 KV 复用）。
+// 正文用普通字符串（text/plain）就行——网关的 `_read_json` 只认 Content-Length，
+// 不看 Content-Type；而且这个类型是"安全"的，连预检都不用发。
+window.addEventListener("beforeunload", function () {
+  const ids = panels.map(function (p) { return p.convId; }).concat(["web-baseline"]);
+  ids.forEach(function (id) {
+    try {
+      navigator.sendBeacon(API + "/v1/conversations/close",
+                           JSON.stringify({ conversation_id: id }));
+    } catch (e) { /* 老浏览器没有 sendBeacon：最坏就是等 TTL 超时，不影响本页演示 */ }
+  });
+});
+
+async function send(p) {
+  const text = p.input.value.trim();
+  if (!text || p.streaming) { return null; }
+  p.input.value = "";
+  grow(p.input);          // 送出去之后框要缩回一行，不然它就一直是上一条问题的身高
+  addMsg(p, "u", "你", text);
+  p.messages.push({ role: "user", content: text });
+  const bubble = addMsg(p, "a", "模型", "");
+  p.bubble = bubble;   // 记下这个气泡：「暂停」后「继续」要接着往它里面写
+
+  p.streaming = true;
+  // 首字延迟是**这一轮**的事：不清掉的话，这一轮还没出第一个字时，面板头上挂着的是
+  // 上一轮的数——看着像"已经出字了"，正好是最容易误判的一帧。
+  p.ttft = null;
+  setPerf(p, "");
+  render(p);
+  updateGlobal();
+  // 生成一起来就让资源那块立刻补一拍：待机档是 6 秒，不补的话点了「② 同时提问」之后
+  // 最多 6 秒里，屏幕上四张卡还是闲着的——而那正是演示时最想看到"卡忙起来"的一帧。
+  sysWake();
+  try {
+    // 这一路的名字**必须稳定**：`p.convId` 从建面板那一刻定下，之后不管顺序怎么变、
+    // 别的窗口删没删，它都不动。改了名字就是换了对话，网关会当成新人重新分会话，
+    // 多轮的 KV 复用也就没了（所以这里用的是身份，不是"第几个面板"）。
+    const r = await streamChat(p.messages, function (soFar, el, n) {
+      bubble.textContent = soFar;
+      p.log.scrollTop = p.log.scrollHeight;
+      if (p.ttft === null) { p.ttft = el; }
+      // 跑动中的速率按**已收到的块数**算（后端一块一块地推，块数≈token 数）。
+      // 这只是流里那个"在动"的数，落账以 usage 为准（收尾那句 setPerf）。
+      setPerf(p, "首字 " + p.ttft.toFixed(1) + "s · "
+                 + (n / Math.max(el, 0.001)).toFixed(1) + " tok/s");
+      if (p.kvSession !== undefined) {
+        setStat(p, "⏳ " + el.toFixed(1) + "s · " + n + " 块 · 会话 " + p.kvSession);
+      } else {
+        setStat(p, "⏳ " + el.toFixed(1) + "s · " + n + " 块");
+      }
+    }, p.convId, function (el) {
+      // 还没拿到会话。**这里一定要说话**：这几秒到几分钟里页面上本来只有一个转圈，
+      // 看着像卡死，而真相是"四个会话都被别的对话占着"。写清楚是"等会话"还是
+      // "等模型"，用户才不会把它当成"板卡坏了/网络断了"。
+      setStat(p, "⏳ " + el.toFixed(1) + "s · 等待空闲会话…（会话都被别的对话占着）");
+    }, null, function (meta) { p.requestId = meta.rid; });
+    const kv = r.kv;
+    p.kvSession = kv.session;
+    if (kv.session !== undefined) { p.sess.textContent = "会话 " + kv.session; }
+    p.messages.push({ role: "assistant", content: r.text });
+    if (r.finish === "abort") {
+      // 用户按了暂停：半截答案**留在历史里**（这是既定的选择）。气泡和 messages 都已经
+      // 有它了，这里只把面板拨到「已暂停」——按钮变「继续」、输入框放开（可以问别的）。
+      p.paused = true;
+    }
+    // 复用到底有没有生效只看 base：base 是**真正被复用的前缀长度**。
+    // 别拿 reset 当判据——首次对话落在"已知为空"的会话上时是 reset=0 但 base=0，
+    // 一个字都没省；照 reset 标"（复用）"就是骗人（第一版就是这么写的）。
+    // 排过队就把排队的时长单独标出来：`el` 是端到端的，分母里含排队，所以那会儿算出来的
+    // `tok/s` **不是解码速度**（226s 排队 + 3s 生成 = 屏幕上写着 1.57 tok/s，看着像模型慢）。
+    // 把两段时间拆开摆着，是这一行最该说清楚的事。
+    setStat(p, "<b>" + r.rate.toFixed(2) + " tok/s</b> · " + r.tok + " tok · "
+            + r.el.toFixed(1) + "s"
+            + (r.waited > 0.05
+               ? "（其中排队 " + r.waited.toFixed(1) + "s，实际推理 "
+                 + Math.max(0, r.el - r.waited).toFixed(1) + "s）" : "")
+            + " · 会话 " + (kv.session !== undefined ? kv.session : "?")
+            + (kv.full ? " · KV " + kv.sent + "/" + kv.full
+                       + (Number(kv.base) > 0
+                          ? "（复用 " + kv.base + "，省 "
+                            + Math.round(100 * (1 - kv.sent / kv.full)) + "%）"
+                          : "（全量）") : "")
+            // 只在**字面**收到 length 时才标。别拿"tok 数 ≈ 设定值"去猜：后端在上下文
+            // 用满时也会停，而那种情况 finish_reason 未必是 length——猜出来的标记会把
+            // "上下文不够了"伪装成"上限设小了"，正是这一页最该避免的误导。
+            + (r.finish === "abort"
+               ? " · <span style='color:var(--warn)'>已暂停</span>"
+               : (r.finish === "length"
+                  ? " · <span style='color:var(--warn)'>触顶截断</span>" : "")));
+    // 性能小字收尾：速率换成**真 token 数**（usage）算出来的那个，和统计行是同一个数。
+    // 一个字都没吐出来的话首字延迟是不存在的，写"—"而不是编一个数出来。
+    setPerf(p, "首字 " + (p.ttft === null ? "—" : p.ttft.toFixed(1) + "s")
+               + " · <b>" + r.rate.toFixed(2) + "</b> tok/s");
+    return r;
+  } catch (err) {
+    bubble.textContent = "出错：" + err.message;
+    bubble.parentNode.className = "msg err";
+    setStat(p, "失败：" + esc(err.message));
+    setPerf(p, "");        // 没量到就别把上一轮的数留在头上
+    return null;
+  } finally {
+    p.streaming = false;
+    render(p);
+    updateGlobal();
+  }
+}
+
+// 「暂停」只发一个 STOP 请求，**不等结果**：停没停到，从这一轮的 DONE（finish_reason=
+// abort）看得到，send() 里会据此拨到「已暂停」。后端收到 STOP 在下一个 token 边界停手，
+// 最坏 0.1 秒之后 DONE 就到了。
+async function pauseTurn(p) {
+  if (!p.streaming || !p.requestId) { return; }
+  try {
+    await fetch(API + "/v1/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: Number(p.requestId) }),
+    });
+  } catch (e) { /* 停不下来最坏就是等它自己跑完，不额外报错 */ }
+}
+
+// 暂停/继续按钮的分发：按面板状态决定这一下是「暂停」还是「继续」。
+// 两件事都是异步的，也都不等结果——停没停到看那一轮的 DONE，继续的进度看流式增量。
+// 两个分支都要挡重入（pauseTurn 挡 !streaming，continueAnswer 挡 streaming/paused）。
+function togglePause(p) {
+  if (p.streaming) { return pauseTurn(p); }
+  if (p.paused) { return continueAnswer(p); }
+  return null;
+}
+
+// 「继续」：后端不 prefill、接着上一轮的 KV 往下 decode，新 token 追加进同一个气泡。
+// 这里**不**往 p.messages 里加新消息——半截答案已经是最后一条 assistant，继续只是把它的
+// 正文加长。身份、max_tokens 都照旧，只是 body 带 continue:true（网关据此走 RESUME）。
+async function continueAnswer(p) {
+  if (p.streaming || !p.paused) { return null; }
+  const base = p.messages[p.messages.length - 1].content;   // 半截正文
+  const bubble = p.bubble;
+  p.paused = false;
+  p.streaming = true;
+  p.ttft = null;
+  setPerf(p, "");
+  render(p);
+  updateGlobal();
+  sysWake();
+  try {
+    const r = await streamChat(p.messages, function (soFar, el, n) {
+      // soFar 是**这一轮**新吐的增量；显示全文 = 半截 + 增量。
+      bubble.textContent = base + soFar;
+      p.log.scrollTop = p.log.scrollHeight;
+      if (p.ttft === null) { p.ttft = el; }
+      setPerf(p, "继续 " + (n / Math.max(el, 0.001)).toFixed(1) + " tok/s");
+    }, p.convId, null,
+    { model: MODEL, continue: true, max_tokens: maxtok(), stream: true,
+      stream_options: { include_usage: true },
+      chat_template_kw: { enable_thinking: document.getElementById("think").checked } },
+    function (meta) { p.requestId = meta.rid; });
+    // 把「继续」吐出来的增量并进历史里那条 assistant（这样下一轮 KV 记账才对得上）。
+    p.messages[p.messages.length - 1].content = base + r.text;
+    const kv = r.kv;
+    p.kvSession = kv.session;
+    if (kv.session !== undefined) { p.sess.textContent = "会话 " + kv.session; }
+    setStat(p, "已继续 <b>" + r.rate.toFixed(2) + " tok/s</b> · 又生成 " + r.tok
+            + " tok · " + r.el.toFixed(1) + "s"
+            + (r.finish === "abort"
+               ? " · <span style='color:var(--warn)'>已暂停</span>"
+               : (r.finish === "length"
+                  ? " · <span style='color:var(--warn)'>触顶截断</span>" : "")));
+    setPerf(p, "首字 " + (p.ttft === null ? "—" : p.ttft.toFixed(1) + "s")
+               + " · <b>" + r.rate.toFixed(2) + "</b> tok/s");
+    // 「继续」过程中用户又按了暂停：这一轮照 send() 的口径处置——半截留在历史里、
+    // 面板回到「已暂停」，按钮变回「继续」可以再接。**必须在这里显式置位**：
+    // 以前 finally 无条件把 paused 清成 false，按钮就此消失，这段回答再也接不回去
+    // （2026-09-21 用户报的第二个坑）。
+    if (r.finish === "abort") { p.paused = true; }
+    return r;
+  } catch (err) {
+    bubble.textContent = base + "（继续失败：" + err.message + "）";
+    bubble.parentNode.className = "msg err";
+    setStat(p, "继续失败：" + esc(err.message));
+    // 失败时半截还在，按钮留在「继续」上：可以重试，也可以直接问别的（send 只看 streaming）。
+    p.paused = true;
+    return null;
+  } finally {
+    p.streaming = false;
+    render(p);
+    updateGlobal();
+  }
+}
+
+// 徽标只写**状态**。四路聚合那一整句去 setSum 了 —— 以前两者共用 #gstats，
+// 于是一句"合计 686 tok / 墙钟 20.1s → 聚合 34.15 tok/s · 伸缩 3.21×"要挤在标题
+// 旁边那个位置，长到把标题行撑开，而且一刷新状态就被覆盖没了。
+function updateGlobal() {
+  const busy = panels.filter(function (p) { return p.streaming; }).length;
+  if (busy > 0) {
+    setStatus("busy", "生成中 " + busy + " 路");
+  } else if (lastSingleRate) {
+    setStatus("idle", "待机 · 基线 " + lastSingleRate.toFixed(2) + " tok/s");
+  } else {
+    setStatus("idle", "待机");
+  }
+}
+
+// 四路汇总那一句。**这里有两种"平均"，混用会把结论说反**：
+//
+//   · 各路速率和 = Σ(tok_i / el_i)：每条路径**自己**跑了多快。四路同时跑时把它们相加，
+//     就是"整块板此刻一共在吐多少 token"。口径和单路基线**完全一样**（都是"某一路的
+//     速率"），所以伸缩比只能用这个。
+//   · 墙钟摊薄 = Σtok_i / 墙钟：把总 token 摊到整段墙上。四路长度不齐时它会**凭空变小**：
+//     某一路在做长生成，另外三路早答完了，后面那一大段只有一路在跑，于是"1 路的吞吐"
+//     被摊进了"4 路并发"的分母——量到的不是并发性能，是"平均有几路在跑"。
+//
+// 实测（2026-09-18 网页四路：153/182/1602/158 tok，墙钟 135.7s）：速率和 41.42 tok/s、
+// 墙钟摊薄 15.43 tok/s，而平均只有 1.37/4 路在跑。**差 2.7 倍，不是误差，是两个问题。**
+// 所以：速率和当主数，摊薄值只在四路长度齐的时候才有意义，不齐就当场说明白是它被摊薄了。
+//
+// （原来的写法只有摊薄值这一个数，标题还写着"聚合"——四路里有一路跑了 135s 时，
+//   屏幕上给出 15.43，看着跟单路基线 10.6 是一路的，"四路并发没什么用"就是这么读出来的。）
+function summarize(rs, wall, baseline) {
+  const n = rs.length;
+  const total = rs.reduce(function (a, r) { return a + r.tok; }, 0);
+  const solo  = rs.reduce(function (a, r) { return a + r.tok / Math.max(r.el, 0.001); }, 0);
+  const w     = Math.max(wall, 0.001);
+  const agg   = total / w;
+  const den   = rs.reduce(function (a, r) { return a + r.el; }, 0) / w;
+  let html = n + " 路并发：各路速率和 <b>" + solo.toFixed(2) + " tok/s</b>（合计 " + total
+           + " tok / 墙钟 " + wall.toFixed(1) + "s）";
+  if (den < n - 0.5) {
+    // 摊薄警告：这是分母里混进了空转时间，不是"并发退化"。
+    // 路数写成 n 而不是"四路"：窗口能增删之后屏幕上可能只有 2 路，说"四路"是假话，
+    // 而这句话正是判读那两个数的关键（它解释的是分母里混进了什么）。
+    html += " · <span style='color:var(--warn)'>" + n + " 路长短不齐，平均只有 " + den.toFixed(2) + "/"
+          + n + " 路在跑</span>，墙钟摊薄 " + agg.toFixed(2) + " tok/s（空转的路也算进了分母，"
+          + "别当并发性能看）";
+  } else {
+    html += " · 墙钟摊薄 " + agg.toFixed(2) + " tok/s（" + n + " 路差不多同时收工，二者等价）";
+  }
+  if (baseline) {
+    html += " · <span style='color:var(--warn)'>伸缩 " + (solo / baseline).toFixed(2)
+          + "×</span>（基线 " + baseline.toFixed(2) + " tok/s，同一口径）";
+  } else {
+    html += " · （先点「①」量个单路基线，就能看到伸缩比）";
+  }
+  // 有哪一路排过队，上面的数就都不是并发性能（分母里混进了等待），必须当场说破——
+  // 不然"某一路没拿到会话"的现场会被读成"并发退化"。**放整句最后**：它撤的是前面
+  // 每一个数（最扎眼的是刚印出来的伸缩比），紧跟在那句话后面才收得住。
+  const q = rs.filter(function (r) { return r.waited > 0.05; });
+  if (q.length) {
+    html += " · <span style='color:var(--warn)'>有 " + q.length + " 路排过队（最多 "
+          + Math.max.apply(null, q.map(function (r) { return r.waited; })).toFixed(1)
+          + "s），上面的数含伸缩比都不可引用</span>";
+  }
+  return html;
+}
+
+// --- 按钮 ---
+
+// 基线**故意不占任何面板**：它要是走了面板 1，面板 1 就会多出一段历史，
+// 后面"4 路同时提问"就不再是从零开始的四段对话了（而且面板 1 的输入框会被清空，
+// 那一批里它会直接不发）。所以这里单独发一次请求量数，量完就丢。
+//
+// 但"丢"要丢得干净：量完必须 close。只有 4 个会话，基线占着 1 个不还，点「②」时
+// 四路里就有一路拿不到会话——**改前**它会一路排到 IDLE_TTL（300s）超时，看起来就是
+// "某一路卡住不动"，而三条腿的画面最容易被当成"并发坏了"。2026-09-18 起网关多了一级
+// 「有人在等就按 contend_idle 收最闲的那段对话」，这种等待被压到秒级，但**基线照样该
+// 还就得还**：交还了才是满 4 路，不然「②」永远只有三路命中 KV。
+document.getElementById("baseline").addEventListener("click", async function () {
+  if (panels.some(function (p) { return p.streaming; })) { return; }
+  setStatus("wait", "基线测量中…");
+  setSum("单路基线测量中（约 20 秒）…");
+  try {
+    const r = await streamChat([{ role: "user", content: "用一句话介绍杭州。" }],
+                               function () {}, "web-baseline", function (w) {
+      setStatus("wait", "等空闲会话 " + w.toFixed(1) + "s…");
+    });
+    lastSingleRate = r.rate;
+    // 徽标交回 "待机 · 基线 X"（updateGlobal 会带上刚记下的那个数），一整句去汇总行。
+    updateGlobal();
+    setSum("单路基线：<b>" + r.rate.toFixed(2) + " tok/s</b>（" + r.tok
+           + " tok / " + r.el.toFixed(1) + "s"
+           + (r.waited > 0.05 ? "，其中排队 " + r.waited.toFixed(1) + "s" : "")
+           + "）→ 现在点「② " + panels.length + " 路同时提问」");
+  } catch (err) {
+    setStatus("err", "基线失败");
+    // 汇总行是 innerHTML（要加粗），所以错误文本必须转义 —— 它来自网关的响应体。
+    setSum("基线测量失败：" + esc(err.message));
+  } finally {
+    // 失败也要交还：失败的那次如果已经把会话绑上了，不还就是同样堵路。
+    closeConv("web-baseline");
+  }
+});
+
+// 四路一起发。**独立成函数是为了能被打到**：page_check.js 直接调 runAll()，走的就是
+// 用户点「②」的那条路（含 summarize + setSum）。以前这段是内联在 addEventListener 里的
+// 匿名函数，检查只能自己 `panels.map(send)` 一遍——于是"汇总行到底怎么算的"这件事
+// **没有任何检查覆盖**，改坏了也全绿。
+//
+// lastRound 把这一轮的原样结果留一份，给检查读（它拿不到 runAll 的返回值）。
+let lastRound = null;
+async function runAll() {
+  if (panels.some(function (p) { return p.streaming; })) { return; }
+  // 全都是空的就填回默认问题（第二轮之后输入框是空的，历史还在——
+  // 这一批就变成"四段对话各自的第二轮"，顺带能看到 KV 复用）
+  if (panels.every(function (p) { return !p.input.value.trim(); })) {
+    // 按**当前位置**取默认问题，且循环取：窗口数不再是固定的 4，多开或删过之后
+    // `DEFAULT_Q[i]` 会取到 undefined（输入框变空，这一路就静默不发）
+    panels.forEach(function (p, i) {
+      p.input.value = DEFAULT_Q[i % DEFAULT_Q.length];
+      grow(p.input);
+    });
+  }
+  const n = panels.filter(function (p) { return p.input.value.trim(); }).length;
+  setStatus("busy", "生成中 " + n + " 路");
+  const t0 = performance.now();
+  const rs = await Promise.all(panels.map(function (p) { return send(p); }));
+  const wall = (performance.now() - t0) / 1000;
+  const ok = rs.filter(function (r) { return r; });
+  lastRound = { rs: rs, wall: wall };
+  if (!ok.length) { updateGlobal(); return; }
+  setSum(summarize(ok, wall, lastSingleRate));
+  // 有哪一路是**失败**回来的，徽标要当场变色：失败只写在那一路自己的统计行里，
+  // 而演示时眼睛看的是中间那块聚合数——"四路里有三路成功"不该看起来像一切正常。
+  // （正常收尾的徽标是 updateGlobal() 在每一路的 finally 里写的，这里覆盖它。）
+  if (ok.length < n) { setStatus("err", ok.length + "/" + n + " 路成功"); }
+}
+document.getElementById("all").addEventListener("click", runAll);
+
+// 「＋ 加窗口」。到上限时按钮本来就是 disabled（浏览器对 disabled 的按钮不派发 click），
+// 但 `addPanel` 自己那道闸**不能撤**：上限是 `refreshHealth` 异步改的，从"还能加"到
+// "加不动了"之间没有重绘，键盘/脚本/以及这一瞬间的点击都绕得过 disabled。
+// 加不动时补一句话：只把按钮变灰的话，用户会以为页面坏了，而不是"板卡只有这么多会话"。
+document.getElementById("addwin").addEventListener("click", function () {
+  if (addPanel()) { return; }
+  document.getElementById("cap").innerHTML +=
+    " —— 不能再加了：后端只开了 " + MAX_SESSIONS + " 个会话"
+    + (CTX_SIZE === null ? ""
+       : "（上下文 " + CTX_SIZE.toLocaleString() + " 时每路 KV 按满上下文预分配）");
+});
+
+document.getElementById("clear").addEventListener("click", resetAll);
+
+function resetAll() {
+  panels.forEach(function (p, i) {
+    p.messages = [];
+    p.log.innerHTML = "";
+    p.sess.textContent = "";
+    p.stat.textContent = "";
+    p.input.value = DEFAULT_Q[i % DEFAULT_Q.length];
+    grow(p.input);
+    p.ttft = null;
+    setPerf(p, "");          // 头上那格性能小字也是"上一次的结果"，一起清
+    p.lastRate = null;
+    // 「清空」= 这几段对话我不要了。历史已经删了，留着会话也只是占着不放：
+    // 显式交还，后面的人（或下一次演示）立刻能用满所有会话。
+    // **交还的是身份而不是"第几格"**：窗口删过之后序号和身份就对不上了，
+    // 按序号还等于还错人（真会话没还，还把一个不存在的 key 报给网关）。
+    closeConv(p.convId);
+  });
+  lastSingleRate = null;
+  setSum("");
+  updateGlobal();
+}
+
+// 窗口数上限在**建面板之前**就要拿到，所以顺序不能反：反过来是先摆出兜底的 4 个窗口、
+// 等 /health 回来再砍掉多的——屏幕上先闪一下再消失，更糟的是那 4 个窗口一旦发过请求
+// 就已经把会话占住了。读不到 /health（页面被当本地文件打开、网关没起）就按兜底值走。
+// capReady 交出去给 page_check.js 等（它是异步的，检查脚本必须等它落地再数面板）。
+let capReady = refreshHealth().then(function () {
+  buildPanels();
+  updateGlobal();
+});
+
+// 资源条开轮询。**在建完面板之后再开**：它会让上面那一屏先落地，而且轮询本身
+// 跟窗口数没关系，没必要抢在容量查询前面发出去。
+renderSys(null);
+startSysPoll();
+
+// 切走了就别轮了：板卡上这一页是投影出来看的，没人看的时候多发一个请求都可能
+// 混进正在测量的那几路里去（带宽/CPU 都在同一台机器上）。切回来立刻补一次，
+// 不用等下一个 2 秒——切回来第一眼看到的不该是旧数字。
+document.addEventListener("visibilitychange", function () {
+  if (document.hidden) { stopSysPoll(); } else { startSysPoll(); }
+});
+
+// 后端被换成别的 NSESSION 重启之后，开着的这一页要能自己发现（容量条会转警告色、
+// 「＋」会禁用）。**容量这块仍然用 focus 而不是定时轮询**：它是一次性的、结论很少变，
+// 而资源那块是每 2s/6s 一次、量的是"现在"——两件事的时效要求不一样。
+window.addEventListener("focus", function () { refreshHealth(); });
+</script>
+</body>
+</html>

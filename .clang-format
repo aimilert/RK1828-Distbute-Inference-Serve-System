@@ -1,0 +1,20 @@
+---
+# C++ 代码风格配置（clang-format）。
+#
+# 基线是 Google C++ Style（https://google.github.io/styleguide/cppguide.html），
+# 只有两处**显式记录**的偏离，都是为兼容本项目既有代码、避免一次性大规模重排：
+#   1. BreakBeforeBraces: Allman —— 项目现有代码是"花括号换行"，Google 默认是同行；
+#   2. ColumnLimit: 100 —— 现有代码有较长的中文注释与 printf 行，Google 默认 80 会切碎。
+# 新代码请以本文件为准；如需完全 Google 风格，把 BreakBeforeBraces 改回 Attach 即可。
+#
+# 用法：clang-format -i <file>（建议只对改动过的文件跑，不要全仓重排）
+BasedOnStyle: Google
+Language: Cpp
+Standard: c++11
+BreakBeforeBraces: Allman
+ColumnLimit: 100
+IndentWidth: 2
+TabWidth: 8
+UseTab: Never
+SortIncludes: true
+AllowShortFunctionsOnASingleLine: Inline

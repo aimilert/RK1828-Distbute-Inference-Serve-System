@@ -1,0 +1,55 @@
+# 构建产物
+build/
+install/
+out/
+*.o
+*.obj
+
+# 部署产物（build_serve.sh / build_serve_native.sh 生成）
+rknn_multicard_demo
+rknn_multicard_demo.serve
+rknn_multicard_demo.serve.bak_*
+
+# 运行时副产物（网关一跑就会生成）
+gateway.log
+gateway_backend.log
+gateway_backend.log*
+board_tests.log
+rknn-temp.local.json
+rknn-temp.json
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 性能基准结果（每跑一次生成一批，属产物不入库）
+tools/perf_results/
+
+# 模型与张量（体积大，按 README 从 SDK / 导出流程获取）
+*.rknn
+*.weight
+*.gguf
+*.embed.bin
+*.safetensors
+tensor_dump/
+
+# 软著登记材料（含登记信息，不入库）
+软著材料/
+全生命周期项目管理系统-*.doc
+全生命周期项目管理系统-*.docx
+
+# ---- 内部资料：不上传 GitHub（保留在本地工作区）----
+# 厂商 SDK 文档（体积大、含版权）
+doc_CN/
+# 测试数据与实测报告
+docs/*.xls
+docs/*.xlsx
+docs/Orin*
+docs/Qwen3.5-27B-*
+# 产品 / 公司材料
+docs/基于复合芯片*
+docs/面向复合AI负载*
+# 内部计划与总结
+docs/端侧Claude接入创新点总结.md
+docs/端侧MLFQ调度-*
+docs/端侧KV内存与上下文卸载-*

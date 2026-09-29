@@ -1,0 +1,31 @@
+# EditorConfig —— 让不同编辑器/IDE 遵守同一套基础格式约定。
+# 规范：https://editorconfig.org/
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+# C / C++（Google C++ 风格：2 空格缩进）
+[*.{c,cc,cpp,h,hpp}]
+indent_size = 2
+
+# Python（PEP 8：4 空格）
+[*.py]
+indent_size = 4
+
+# 前端与脚本（与项目既有代码一致）
+[*.{js,css,html,json,yml,yaml,sh}]
+indent_size = 2
+
+# Markdown 不裁剪行尾空格（两个空格在 Markdown 里是换行语义）
+[*.md]
+trim_trailing_whitespace = false
+
+# Makefile 必须用 Tab
+[Makefile]
+indent_style = tab
+indent_size = 4

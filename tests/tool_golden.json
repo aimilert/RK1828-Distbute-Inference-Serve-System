@@ -1,0 +1,595 @@
+{
+ "source": "tokenizer.chat_template of Qwen3.5-27B (GGUF key, CTX8192 export)",
+ "generated_by": "rt_work/gen_golden.py",
+ "note": "want = 真 Jinja2 渲模型自己的模板。比对前按 gen_tail / wrap 两处本项目**刻意**的偏差做剥离，见 toolcalls.py 顶部。",
+ "wrap": "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+ "wrap_off": "<|im_start|>assistant\n",
+ "cases": [
+  {
+   "name": "无工具：system + user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "你好"
+    }
+   ],
+   "tools": [],
+   "enable_thinking": null,
+   "no_think_marks": false,
+   "gen_tail": "<|im_start|>assistant\n<think>\n",
+   "wrappers": 0,
+   "want": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "无工具：多轮",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "A"
+    },
+    {
+     "role": "assistant",
+     "content": "B"
+    },
+    {
+     "role": "user",
+     "content": "C"
+    }
+   ],
+   "tools": [],
+   "enable_thinking": null,
+   "no_think_marks": false,
+   "gen_tail": "<|im_start|>assistant\n<think>\n",
+   "wrappers": 0,
+   "want": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "无工具：assistant 在最后一个 user 之后（模板同样会包一层）",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "A"
+    },
+    {
+     "role": "assistant",
+     "content": "B"
+    }
+   ],
+   "tools": [],
+   "enable_thinking": null,
+   "no_think_marks": false,
+   "gen_tail": "<|im_start|>assistant\n<think>\n",
+   "wrappers": 1,
+   "want": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nB<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "工具：system + user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "北京今天多少度？"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "查某城市当前天气 <带尖括号> & 单引号'",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "城市名"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noop",
+      "description": "什么都不做",
+      "parameters": {}
+     }
+    }
+   ],
+   "enable_thinking": null,
+   "no_think_marks": false,
+   "gen_tail": "<|im_start|>assistant\n<think>\n",
+   "wrappers": 0,
+   "want": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"\\u67e5\\u67d0\\u57ce\\u5e02\\u5f53\\u524d\\u5929\\u6c14 \\u003c\\u5e26\\u5c16\\u62ec\\u53f7\\u003e \\u0026 \\u5355\\u5f15\\u53f7\\u0027\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"\\u57ce\\u5e02\\u540d\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n{\"function\": {\"description\": \"\\u4ec0\\u4e48\\u90fd\\u4e0d\\u505a\", \"name\": \"noop\", \"parameters\": {}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n北京今天多少度？<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "工具：助手带一条调用、正文为空",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "北京今天多少度？"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "北京",
+         "unit": "celsius"
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "查某城市当前天气 <带尖括号> & 单引号'",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "城市名"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noop",
+      "description": "什么都不做",
+      "parameters": {}
+     }
+    }
+   ],
+   "enable_thinking": null,
+   "no_think_marks": false,
+   "gen_tail": "<|im_start|>assistant\n<think>\n",
+   "wrappers": 1,
+   "want": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"\\u67e5\\u67d0\\u57ce\\u5e02\\u5f53\\u524d\\u5929\\u6c14 \\u003c\\u5e26\\u5c16\\u62ec\\u53f7\\u003e \\u0026 \\u5355\\u5f15\\u53f7\\u0027\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"\\u57ce\\u5e02\\u540d\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n{\"function\": {\"description\": \"\\u4ec0\\u4e48\\u90fd\\u4e0d\\u505a\", \"name\": \"noop\", \"parameters\": {}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n北京今天多少度？<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n北京\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "工具：助手带正文 + 两条调用（空参数 / 嵌套容器）",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "先查两个",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "noop",
+        "arguments": {}
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "f2",
+        "arguments": {
+         "a": 1,
+         "b": [
+          1,
+          2
+         ],
+         "c": {
+          "d": "e"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "查某城市当前天气 <带尖括号> & 单引号'",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "城市名"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noop",
+      "description": "什么都不做",
+      "parameters": {}
+     }
+    }
+   ],
+   "enable_thinking": null,
+   "no_think_marks": false,
+   "gen_tail": "<|im_start|>assistant\n<think>\n",
+   "wrappers": 1,
+   "want": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"\\u67e5\\u67d0\\u57ce\\u5e02\\u5f53\\u524d\\u5929\\u6c14 \\u003c\\u5e26\\u5c16\\u62ec\\u53f7\\u003e \\u0026 \\u5355\\u5f15\\u53f7\\u0027\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"\\u57ce\\u5e02\\u540d\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n{\"function\": {\"description\": \"\\u4ec0\\u4e48\\u90fd\\u4e0d\\u505a\", \"name\": \"noop\", \"parameters\": {}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n先查两个\n\n<tool_call>\n<function=noop>\n</function>\n</tool_call>\n<tool_call>\n<function=f2>\n<parameter=a>\n1\n</parameter>\n<parameter=b>\n[1, 2]\n</parameter>\n<parameter=c>\n{\"d\": \"e\"}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "工具：连续两条 tool 消息合成一个 user 轮",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "noop",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "18 摄氏度"
+    },
+    {
+     "role": "tool",
+     "content": "湿度 40%"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "查某城市当前天气 <带尖括号> & 单引号'",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "城市名"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noop",
+      "description": "什么都不做",
+      "parameters": {}
+     }
+    }
+   ],
+   "enable_thinking": null,
+   "no_think_marks": false,
+   "gen_tail": "<|im_start|>assistant\n<think>\n",
+   "wrappers": 1,
+   "want": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"\\u67e5\\u67d0\\u57ce\\u5e02\\u5f53\\u524d\\u5929\\u6c14 \\u003c\\u5e26\\u5c16\\u62ec\\u53f7\\u003e \\u0026 \\u5355\\u5f15\\u53f7\\u0027\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"\\u57ce\\u5e02\\u540d\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n{\"function\": {\"description\": \"\\u4ec0\\u4e48\\u90fd\\u4e0d\\u505a\", \"name\": \"noop\", \"parameters\": {}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=noop>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 摄氏度\n</tool_response>\n<tool_response>\n湿度 40%\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "工具：单条 tool 消息 + 后续追问",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "noop",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "ok"
+    },
+    {
+     "role": "user",
+     "content": "那明天呢？"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "查某城市当前天气 <带尖括号> & 单引号'",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "城市名"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noop",
+      "description": "什么都不做",
+      "parameters": {}
+     }
+    }
+   ],
+   "enable_thinking": null,
+   "no_think_marks": false,
+   "gen_tail": "<|im_start|>assistant\n<think>\n",
+   "wrappers": 0,
+   "want": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"\\u67e5\\u67d0\\u57ce\\u5e02\\u5f53\\u524d\\u5929\\u6c14 \\u003c\\u5e26\\u5c16\\u62ec\\u53f7\\u003e \\u0026 \\u5355\\u5f15\\u53f7\\u0027\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"\\u57ce\\u5e02\\u540d\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n{\"function\": {\"description\": \"\\u4ec0\\u4e48\\u90fd\\u4e0d\\u505a\", \"name\": \"noop\", \"parameters\": {}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=noop>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>user\n那明天呢？<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "工具：tool 消息在最前面（不合法但别崩）",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    },
+    {
+     "role": "tool",
+     "content": "孤儿结果"
+    },
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "查某城市当前天气 <带尖括号> & 单引号'",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "城市名"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noop",
+      "description": "什么都不做",
+      "parameters": {}
+     }
+    }
+   ],
+   "enable_thinking": null,
+   "no_think_marks": false,
+   "gen_tail": "<|im_start|>assistant\n<think>\n",
+   "wrappers": 0,
+   "want": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"\\u67e5\\u67d0\\u57ce\\u5e02\\u5f53\\u524d\\u5929\\u6c14 \\u003c\\u5e26\\u5c16\\u62ec\\u53f7\\u003e \\u0026 \\u5355\\u5f15\\u53f7\\u0027\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"\\u57ce\\u5e02\\u540d\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n{\"function\": {\"description\": \"\\u4ec0\\u4e48\\u90fd\\u4e0d\\u505a\", \"name\": \"noop\", \"parameters\": {}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n<tool_response>\n孤儿结果\n</tool_response><|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "关思考（/no_think）：工具 + 多轮",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "noop",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "ok"
+    },
+    {
+     "role": "user",
+     "content": "那明天呢？"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "查某城市当前天气 <带尖括号> & 单引号'",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "城市名"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "noop",
+      "description": "什么都不做",
+      "parameters": {}
+     }
+    }
+   ],
+   "enable_thinking": false,
+   "no_think_marks": true,
+   "gen_tail": "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "wrappers": 0,
+   "want": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"\\u67e5\\u67d0\\u57ce\\u5e02\\u5f53\\u524d\\u5929\\u6c14 \\u003c\\u5e26\\u5c16\\u62ec\\u53f7\\u003e \\u0026 \\u5355\\u5f15\\u53f7\\u0027\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"\\u57ce\\u5e02\\u540d\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n{\"function\": {\"description\": \"\\u4ec0\\u4e48\\u90fd\\u4e0d\\u505a\", \"name\": \"noop\", \"parameters\": {}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nq /no_think<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=noop>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>user\n那明天呢？ /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "关思考：普通多轮（与工具无关的老行为，一个字节都不该变）",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "记住暗号。"
+    },
+    {
+     "role": "assistant",
+     "content": "收到"
+    },
+    {
+     "role": "user",
+     "content": "暗号是什么？"
+    }
+   ],
+   "tools": [],
+   "enable_thinking": false,
+   "no_think_marks": true,
+   "gen_tail": "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "wrappers": 0,
+   "want": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n记住暗号。 /no_think<|im_end|>\n<|im_start|>assistant\n收到<|im_end|>\n<|im_start|>user\n暗号是什么？ /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ ]
+}

@@ -1,0 +1,53 @@
+# 统一行尾与二进制判定。
+#
+# 背景（本项目真实踩过的坑）：项目在 Windows 上开发、在 Linux 板卡上部署，历史上多次
+# 因为工作区是 CRLF 而出问题——板卡上的 shell 脚本带 `\r` 直接执行失败、Python 的
+# shebang 变成 `python3\r` 使 systemd 报 203/EXEC（见 CHANGELOG 2026-09-22）。
+# 这里显式声明 `eol=lf`：**工作区与仓库都统一 LF**，不再依赖 core.autocrlf 的隐式行为，
+# 从机制上消除这类故障（板卡上传前的 `sed -i 's/\r$//'` 也就不再必要）。
+# 注：仓库里现存对象本来就是 LF（core.autocrlf=true 的入库结果），本条不产生内容变更。
+
+# 默认：识别为文本的文件一律 LF
+* text=auto eol=lf
+
+# 需要保持 LF 的源码与脚本（板卡会直接执行/编译）
+*.sh           text eol=lf
+*.py           text eol=lf
+*.cc           text eol=lf
+*.cpp          text eol=lf
+*.h            text eol=lf
+*.hpp          text eol=lf
+*.js           text eol=lf
+*.html         text eol=lf
+*.css          text eol=lf
+*.json         text eol=lf
+*.md           text eol=lf
+*.txt          text eol=lf
+*.yml          text eol=lf
+*.yaml         text eol=lf
+*.service      text eol=lf
+CMakeLists.txt text eol=lf
+
+# Windows 专用批处理保留 CRLF
+*.bat          text eol=crlf
+*.cmd          text eol=crlf
+
+# 二进制：不做任何转换，也不参与 diff
+*.so           binary
+*.a            binary
+*.o            binary
+*.png          binary
+*.jpg          binary
+*.jpeg         binary
+*.gif          binary
+*.pdf          binary
+*.doc          binary
+*.docx         binary
+*.xls          binary
+*.xlsx         binary
+*.zip          binary
+*.rknn         binary
+*.weight       binary
+*.gguf         binary
+*.embed.bin    binary
+*.safetensors  binary

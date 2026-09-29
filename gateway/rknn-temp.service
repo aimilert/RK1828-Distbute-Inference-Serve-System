@@ -1,0 +1,55 @@
+# RK1828 结温采集（2026-09-20）。**以 root 跑**，原因见 rknn_smi_temp.py 顶上的注释：
+# 读卡温要走 rknn-smi，而它要打开 /dev/pcie-rkep-* （root-only）。
+#
+# 为什么是"独立小进程写文件"而不是"给网关一条免密 sudo"：网关是局域网上**无鉴权**的
+# 常驻服务（见 CHANGELOG 2026-09-20 那条），让它具备拉起 root 进程的能力是不划算的
+# 交换。这一半 **只读设备、只写 /run 下一个文件**，不监听、不联网；网关还是 pi，
+# 读不到那个文件时页面上画 "—"，不影响任何别的功能。
+#
+# 安装（板卡上，路径按实际改；`@SERVE_DIR@` 是仓库里的占位符，因为这个文件要进 git、
+# 而板卡上的绝对路径不进仓库）：
+#
+#     cd <板卡上的 serve 目录>
+#     sed "s|@SERVE_DIR@|$PWD|" rknn-temp.service | sudo tee /etc/systemd/system/rknn-temp.service
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now rknn-temp
+#     systemctl status rknn-temp --no-pager        # 看有没有在跑
+#     cat /run/rknn-temp.json                      # 看数对不对（应当四张卡都有 c）
+#
+# 卸载 / 停掉：
+#
+#     sudo systemctl disable --now rknn-temp
+#
+# ⚠️ 装的时候别写成 `echo <密码> | sudo -S tee /etc/systemd/system/rknn-temp.service`：
+#    **`sudo -S` 和 `tee` 抢同一个 stdin**——密码被 sudo 读走之后 tee 拿到的是 EOF，
+#    结果是建出一个 **0 字节的单元文件**，`systemctl enable` 报的是
+#    `Unit file ... is masked`（听着像被谁屏蔽了，其实是空的，`ls -l` 一看 0 字节）。
+#    先落到 /tmp 再 cp 就没这个问题：
+#
+#        sed "s|@SERVE_DIR@|$PWD|" rknn-temp.service > /tmp/rknn-temp.service
+#        sudo cp /tmp/rknn-temp.service /etc/systemd/system/rknn-temp.service
+#
+# ⚠️ 装了它之后**别再手工跑 `rknn-smi info -w`**：同一时刻只能有一个 rknn-smi，
+# 那个守护式的进程会让本服务每一轮都 Failed to initialize rknnsmi（现象是
+# /run/rknn-temp.json 的 ts 不再更新、页面上的温度变成 "—"）。手工排障跑
+# `rknn-smi info` 一次性的没问题，撞上的概率小。
+
+[Unit]
+Description=RK1828 chip temperature collector (rknn-smi -> /run/rknn-temp.json)
+Documentation=file:@SERVE_DIR@/rknn_smi_temp.py
+After=multi-user.target
+
+[Service]
+Type=simple
+# 必须是 root：/dev/pcie-rkep-* 是 crw------- root root
+User=root
+ExecStart=@SERVE_DIR@/rknn_smi_temp.py --interval 5
+# 只是读设备 + 写一个小文件，别跟推理抢 CPU（4 张卡都在这台机器上跑）
+Nice=10
+# 脚本自己内部就是死循环、失败不退出（设备忙的时候下一轮多半就好），所以真退出=出事了；
+# 3 秒后再来。不加 Restart=always 的话一次意外退出就永久停摆，页面上只是安静地变成 "—"。
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
