@@ -119,7 +119,7 @@ python3 bench_agent.py --compare perf_results/bench_baseline_*.json \
 
 ## 7. 注意事项
 
-- 每次跑之前确认模型已加载完（`/health` 返回 `ok`）；模型加载约 240 秒。
+- 每次跑之前确认模型已加载完（`/health` 返回 `ok`）；模型加载：串行 ~140s / `PARALLEL_LOAD=1` ~62s。
 - A/B 之间**不要让别的客户端同时打板卡**（Claude Code、演示页都会抢会话）：
   先 `POST /v1/perf/reset`，跑完立刻读，避免把别人的请求算进来。
 - `--sessions` 超过板卡 `NSESSION` 时是刻意制造排队；对齐算法收益时不要超过。

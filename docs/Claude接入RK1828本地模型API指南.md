@@ -29,7 +29,7 @@ Claude Code ──Anthropic Messages(/v1/messages)──▶ CC Switch 本地路�
 
 ## 2. 前置条件
 
-- 板卡网关已启动并加载完模型（模型加载约 240 秒）：
+- 板卡网关已启动并加载完模型（模型加载：串行 ~140s / `PARALLEL_LOAD=1` ~62s）：
   `curl http://192.168.0.184:18280/health` 返回 `"status": "ok"`。
 - 与板卡同一局域网、能访问 `192.168.0.184:18280`。**只应在可信网络内使用**：该网关无鉴权。
 - CC Switch 3.17.0 及以上（含本地路由与 API 格式转换），Claude Code 已安装并至少运行过一次。
@@ -156,7 +156,7 @@ $ curl -N -s http://192.168.0.184:18280/v1/chat/completions \
 ## 8. 板卡侧运维
 
 ```bash
-# 启动（模型加载约 240 秒；NSESSION 受内存账约束，超限会被容量闸拒绝）
+# 启动（模型加载：串行 ~140s / PARALLEL_LOAD=1 ~62s；NSESSION 受内存账约束，超限会被容量闸拒绝）
 cd ~/rk1828-multisession
 INSTALL_DIR=$PWD/install/rknn_multicard_demo \
 MODEL_DIR=/home/pi/xyf_workspace/4rk1828_Test/Qwen3.5-27B \

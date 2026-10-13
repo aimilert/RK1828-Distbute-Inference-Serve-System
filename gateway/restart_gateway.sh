@@ -1,5 +1,5 @@
 #!/bin/bash
-# 重启网关（含后端子进程）。模型加载 ~240s，之后才能收请求。
+# 重启网关（含后端子进程）。模型加载：串行 ~140s / PARALLEL_LOAD=1 ~62s，之后才能收请求。
 #
 # 为什么单独写成脚本，而不是在命令行里串一串：`pkill -f rkllm_gateway.py` 会**匹配到
 # 执行它的那条命令本身**——远端 shell 的 cmdline 里就含这个字符串，于是 pkill 把
@@ -29,4 +29,4 @@ pkill -f 'rknn_multicard_demo[.]serve' && sleep 3
 rm -f "$LOG" "$GATEWAY_DIR/gateway_backend.log"
 cd "$GATEWAY_DIR" || exit 1
 setsid nohup ./start_gateway.sh < /dev/null > "$LOG" 2>&1 &
-echo "gateway restarting (model load ~240s); watch $LOG"
+echo "gateway restarting (model loading ~140s serial / ~62s with PARALLEL_LOAD=1); watch $LOG"

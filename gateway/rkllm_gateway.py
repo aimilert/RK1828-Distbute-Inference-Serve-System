@@ -71,7 +71,7 @@ try:
     DUMP_REQ_CHARS = int(os.environ.get("DUMP_REQ_CHARS") or 400)
 except ValueError:
     DUMP_REQ_CHARS = 400
-BACKEND_READY_TIMEOUT = 900.0     # 模型加载约 230-240s，留足余量
+BACKEND_READY_TIMEOUT = 900.0     # 模型加载：串行 ~140s / PARALLEL_LOAD=1 ~62s，留足余量
 REQUEST_TIMEOUT = 1800.0          # 单轮最长等待（长上下文 prefill 很慢）
 DEFAULT_MAX_NEW_TOKENS = 512
 
@@ -3610,7 +3610,7 @@ class _AliveOnlyBackend(object):
     """只给 selftest_pool_liveness 用：池子对后端只要求 `sessions` / `on_clear` / `alive` 三样。
 
     这里敢用桩是因为被测的是**池子那条判据本身**（"等不出结果就别让人排"），它与帧协议、
-    与哪台后端都无关；用真后端反而要额外起一个进程、白等 240s 加载模型。端到端那一半
+    与哪台后端都无关；用真后端反而要额外起一个进程、白等 ~140s 加载模型。端到端那一半
     （真后端被打死之后，5 段对话不再一起空等到 600s）在板卡上验，见文档 §9.11。
     """
 
@@ -5040,7 +5040,8 @@ def main():
 
     backend = Backend(demo_argv, args.backend_log,
                       frame_fd="stdout" if args.frames_stdout else None)
-    print("[gateway] starting backend, model load takes ~230-240s ...", flush=True)
+    print("[gateway] starting backend: model loading ~140s serial / ~62s with PARALLEL_LOAD=1 ...",
+          flush=True)
     try:
         backend.start()
     except BackendError as exc:
