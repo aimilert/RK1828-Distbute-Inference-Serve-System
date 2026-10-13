@@ -18,6 +18,8 @@
 #   MODEL_ID     /health、/v1/models 里展示的模型名；默认 qwen3.5-27b（换模型时建议同步改）
 #   DUMP_REQ     设 1 时把每次请求的**摘要**追加到 $GATEWAY_DIR/request_dump.jsonl（调试用，
 #                默认关）；可用 DUMP_REQ_FILE / DUMP_REQ_CHARS 改路径与预览长度。
+#   PARALLEL_LOAD 设 1 时执行器**四卡并行加载**（默认串行；`0`/`false`/`no` 视为关）。
+#   LOAD_TIMING  设 1 时打印每卡加载拆解与初始化循环 wall（同上，`0`/`false`/`no` 视为关）。
 #   GATEWAY_DIR  本脚本与网关所在目录；默认 = 脚本自己所在目录
 #   B            后端二进制名；默认 ./rknn_multicard_demo.serve（由 build_serve.sh 产出）
 #   NSESSION     会话数 = **同时活跃的对话数上限**；默认 4。真实上限由内存账决定
