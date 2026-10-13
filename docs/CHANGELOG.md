@@ -34,8 +34,8 @@
   **不抢占、不动 KV 记账**；`fcfs`（默认）路径与改造前**逐字节一致**。
 - `bench_agent.py --hetero`：异构负载（各会话的 prompt/输出/工具等待按倍数不同）。
   ⚠️ 同构负载下五个因子没有区分度、排序退化为 FCFS，A/B 会看不出差别——这条写进了
-  `PERF.md` 第 6 节。
-- `PERF.md` 第 6 节：端侧因子映射表、可调项、A/B 标准步骤。
+  `PERF.md`。
+- `PERF.md`：指标口径与 A/B 标准步骤；策略实现见 `gateway/mlfq_sched.py`。
 
 **验证**：`mlfq_sched.selftest` 13 项纯算术全过（FCFS / sa / cp / pf / 长任务限流 /
 权重解析）；桩网关带竞争（6 会话打 4 会话）分别跑通 `mlfq` 与 `fcfs` 两条路径、

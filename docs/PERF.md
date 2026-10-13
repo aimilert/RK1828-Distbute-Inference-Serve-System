@@ -108,61 +108,14 @@ python3 bench_agent.py --compare perf_results/bench_baseline_*.json \
 
 **至少连跑 3 轮取中位数**：这套栈的贪婪解码不保证逐字节复现，单轮差异里有噪声。
 
-## 6. 调度策略 A/B（MLFQ）
+## 6. 调度策略 A/B
 
-网关的会话分配有两种策略，用 `SCHED_POLICY` 在**启动时**选（`start_gateway.sh` 透传，
-网关参数 `--sched-policy`）：
+网关的会话分配策略（`fcfs` / `mlfq` / `sjf` / …）用 `SCHED_POLICY` 在**启动时**选。策略的完整说明见 `gateway/mlfq_sched.py` 与 `CHANGELOG.md`；本节只留与指标口径相关的要点：
 
-| 策略 | 行为 |
-|---|---|
-| `fcfs`（默认） | 会话空出来时，等待者谁先被条件变量叫醒谁拿（先到先得，不保证严格顺序）。**与改造前逐字节一致**，不设开关就跑这个 |
-| `mlfq` | 会话空出来、且队列里不止一个人等时，先给候选**打分**，只让最高分者拿走（不抢占） |
-
-打分沿用服务端 `algorithm/mlfq` 的五因子与权重，但因子全部换成**端侧可观测近似**
-（板卡看不到 trace 的未来）：
-
-| 服务端因子 | 端侧近似 | 来源 |
-|---|---|---|
-| cp 关键路径（剩余算力） | 本轮估算算力 = 估算 prompt token + `max_tokens` | 请求本身 |
-| cr 完成奖励（剩余轮数） | 恒 0（不可观测；归一化后是常数，不参与排序） | — |
-| sa 饥饿避免 | 在队列里已等待的秒数 | 会话池 |
-| pf 前缀亲和 | 本轮 prompt 与候选会话 `known` 前缀的重合比例 | 会话池 |
-| tl 工具补偿 | `1/(1+距上次提问结束的空闲秒数)` | 会话池 |
-| 长任务分流（Q2） | 估算 prompt 超阈值时限制并发（默认 8192 tok、上限 `max(1,NSESSION//2)`） | 请求本身 |
-
-其它可调项（都有默认，一般不用动）：
-
-```bash
-SCHED_POLICY=mlfq \
-SCHED_WEIGHTS=0.4,0.3,0.15,0.1,0.05 \   # cp,cr,sa,pf,tl
-SCHED_LONG_TOKENS=8192 \                # 长任务阈值（估算 token）
-SCHED_LONG_MAX=1 \                      # 长任务并发上限
-./start_gateway.sh
-```
-
-**A/B 步骤**（同机同负载，只换策略）：
-
-```bash
-# 1) 关键：必须有排队，策略才有作用——bench 的会话数要大于 NSESSION
-#    （板上 NSESSION=2，就开 4~6 个会话；且用 --hetero 制造长短差异，见下）
-python3 bench_agent.py --base http://127.0.0.1:18280 --label fcfs \
-  --sessions 4 --rounds 3 --prompt-bytes 2000 --output-tokens 96 --tools --hetero
-
-# 2) 重启网关换策略（模型重载约 240s）
-SCHED_POLICY=mlfq ./restart_gateway.sh
-
-# 3) 同一条命令再跑
-python3 bench_agent.py --base http://127.0.0.1:18280 --label mlfq \
-  --sessions 4 --rounds 3 --prompt-bytes 2000 --output-tokens 96 --tools --hetero
-
-# 4) 对比
-python3 bench_agent.py --compare perf_results/bench_fcfs_*.json \
-                                perf_results/bench_mlfq_*.json
-```
-
-⚠️ **同构负载下两者会几乎一样**：五个因子都是"相对大小"参与打分，若所有会话的
-prompt/输出/工具等待完全相同，归一化后没有区分度，排序退化为 FCFS。必须用
-`--hetero`（各会话按 `HETERO_SCALE` 取不同倍数），或直接看真实 Claude 的混合流量。
+- **必须有排队，策略才有作用**：bench 的会话数要大于 `NSESSION`，且用 `--hetero` 制造长短差异
+  （同构负载下打分无区分度 → 退化为 FCFS）。
+- A/B 起跑线：`POST /v1/perf/reset` → 打负载 → 读 `/v1/perf`；同负载**至少连跑 3 轮取中位数**。
+- 除速率外，移植算法还可能要比**功耗**（板卡另有功耗统计器）——把功耗与 `output_tokens_s` 一起看。
 
 ## 7. 注意事项
 

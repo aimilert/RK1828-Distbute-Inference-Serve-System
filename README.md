@@ -24,7 +24,7 @@ HTTP 网关，让多路会话真正并行地流式出字。
 | `scripts/`        | 构建脚本（`build_serve.sh` / `build_serve_native.sh`；带产物断言）                                                                                    |
 | `tests/`          | 验收与自检脚本（`run_all_board_tests.sh`、`page_check.js`、`fake_backend.py` 等）                                                                     |
 | `tools/`          | 基准与运维工具（`bench_agent.py`、`benefit_eval.py`、`rknn_smi_temp.py`、演示脚本）                                                                  |
-| `docs/`           | 面向使用者的文档（`README.md` / `DEMO.md` / `CHANGELOG.md` / `PERF.md`）                                                                             |
+| `docs/`           | 文档：`README.md`（用法）/ `DEMO.md`（演示）/ `CHANGELOG.md` / `PERF.md`（指标口径） |
 | `algorithm/mlfq/` | 上层调度算法的服务端参考实现                                                                                                                          |
 | `CMakeLists.txt`  | 独立构建入口                                                                                                                                          |
 
