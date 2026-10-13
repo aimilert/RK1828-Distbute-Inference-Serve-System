@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -2314,11 +2315,13 @@ static bool init_stage_context(StageContext& stage, size_t stage_idx, const char
   memset(&ext, 0, sizeof(ext));
   ext.device_id = const_cast<char*>(device_id);
 
+  auto t_init0 = std::chrono::steady_clock::now();
   int ret = rknn3_init(&stage.ctx, &ext);
   if (ret != RKNN3_SUCCESS) {
     printf("[%s] rknn3_init failed, ret=%d\n", stage.name.c_str(), ret);
     return false;
   }
+  auto t_load0 = std::chrono::steady_clock::now();
 
   ret = rknn3_load_model_from_path(stage.ctx, stage.model_path.c_str(), stage.weight_path.c_str());
   if (ret != RKNN3_SUCCESS) {
@@ -2326,6 +2329,7 @@ static bool init_stage_context(StageContext& stage, size_t stage_idx, const char
     destroy_context(stage);
     return false;
   }
+  auto t_load1 = std::chrono::steady_clock::now();
 
   rknn3_config cfg;
   memset(&cfg, 0, sizeof(cfg));
@@ -2336,6 +2340,7 @@ static bool init_stage_context(StageContext& stage, size_t stage_idx, const char
     destroy_context(stage);
     return false;
   }
+  auto t_modelinit1 = std::chrono::steady_clock::now();
   // rknn3_set_input_name_alias(stage.ctx, "inputs_embeds", "input_embeds");
   // rknn3_set_input_name_alias(stage.ctx, "hidden_states", "input_embeds");
   rknn3_llm_config llm_cfg;
@@ -2367,6 +2372,22 @@ static bool init_stage_context(StageContext& stage, size_t stage_idx, const char
 
   printf("[%s] context init done: embedding_dim=%d vocab_size=%d max_ctx_len=%d outputs=%d\n",
          stage.name.c_str(), stage.embedding_dim, stage.vocab_size, stage.max_ctx_len, stage.n_output_tensors);
+  // 加载耗时拆解（LOAD_TIMING=1 或 --verbose）：用来判断"加载慢"是卡在哪一段。
+  auto t_end = std::chrono::steady_clock::now();
+  if (g_verbose || getenv("LOAD_TIMING") != nullptr) {
+    auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+      return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+    };
+    long long wbytes = 0;
+    struct stat st_w;
+    if (stat(weight_path, &st_w) == 0) { wbytes = (long long)st_w.st_size; }
+    long long load_ms = ms(t_load0, t_load1);
+    double mb_s = (load_ms > 0) ? (wbytes / 1e6) / (load_ms / 1000.0) : 0.0;
+    printf("[%s] LOAD_TIMING init=%lldms load_model=%lldms (weight=%.2fGB, %.0f MB/s) "
+           "model_init=%lldms post=%lldms total=%lldms\n",
+           stage.name.c_str(), ms(t_init0, t_load0), load_ms, wbytes / 1e9, mb_s,
+           ms(t_load1, t_modelinit1), ms(t_modelinit1, t_end), ms(t_init0, t_end));
+  }
   return true;
 }
 
@@ -5017,14 +5038,44 @@ int main(int argc, char** argv)
 
   // 第一遍：每卡建 context（权重只加载一次，多会话共享）。
   bool ok = true;
-  for (size_t i = 0; i < stages.size(); ++i) {
-    const char* device_id = ext_device_ids.empty() ? devs.devices[i].id : ext_device_ids[i].c_str();
-    ok = init_stage_context(stages[i], i, device_id,
-                            model_paths[i].c_str(), weight_paths[i].c_str(), run_core_mask,
-                            &input_cb_data);
-    if (!ok) {
-      break;
+  // 实验开关：PARALLEL_LOAD=1 时用 4 个线程**同时**初始化 4 个 stage（各占一张卡、互相
+  // 独立）。默认关（串行），保持与改造前逐字节一致的启动顺序。
+  const bool parallel_load = (getenv("PARALLEL_LOAD") != nullptr);
+  auto t_loop0 = std::chrono::steady_clock::now();
+  if (parallel_load && stages.size() > 1) {
+    std::vector<std::thread> pool;
+    std::vector<char> oks(stages.size(), 0);
+    for (size_t i = 0; i < stages.size(); ++i) {
+      const char* device_id = ext_device_ids.empty() ? devs.devices[i].id
+                                                     : ext_device_ids[i].c_str();
+      pool.emplace_back([&, i, device_id]() {
+        oks[i] = init_stage_context(stages[i], i, device_id, model_paths[i].c_str(),
+                                    weight_paths[i].c_str(), run_core_mask,
+                                    &input_cb_data) ? 1 : 0;
+      });
     }
+    for (auto& th : pool) { th.join(); }
+    for (size_t i = 0; i < oks.size(); ++i) { if (!oks[i]) { ok = false; break; } }
+  } else {
+    for (size_t i = 0; i < stages.size(); ++i) {
+      const char* device_id = ext_device_ids.empty() ? devs.devices[i].id
+                                                     : ext_device_ids[i].c_str();
+      ok = init_stage_context(stages[i], i, device_id,
+                              model_paths[i].c_str(), weight_paths[i].c_str(), run_core_mask,
+                              &input_cb_data);
+      if (!ok) {
+        break;
+      }
+    }
+  }
+  auto t_loop1 = std::chrono::steady_clock::now();
+  // 只在显式要看耗时（--verbose / LOAD_TIMING）或走并行实验开关时才打印，保证默认启动
+  // 输出与改造前逐字节一致。
+  if (g_verbose || parallel_load || getenv("LOAD_TIMING") != nullptr) {
+    printf("[load] init loop wall = %lld ms (parallel=%d)\n",
+           (long long)std::chrono::duration_cast<std::chrono::milliseconds>(t_loop1 - t_loop0)
+               .count(),
+           (int)parallel_load);
   }
   // 第二遍：在已建好的 context 上开会话。这套 context 是复用的——权重与每卡设备
   // 内存只有一份。未指定 --sessions 时只建 conversation 这一个会话（走原有单会话
