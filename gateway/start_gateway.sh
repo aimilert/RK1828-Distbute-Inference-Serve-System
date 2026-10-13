@@ -14,6 +14,10 @@
 # 环境变量：
 #   INSTALL_DIR  安装目录（含 rknn_multicard_demo 与 lib/）；默认取仓库里的默认安装路径
 #   MODEL_DIR    模型目录（*.rknn / *.weight / *.tokenizer.gguf / *.embed.bin / *.safetensors）
+#   MODEL_PREFIX 权重/分词器文件名前缀；默认 Qwen3.5-27B-llm（换一批模型时改这个即可）
+#   MODEL_ID     /health、/v1/models 里展示的模型名；默认 qwen3.5-27b（换模型时建议同步改）
+#   DUMP_REQ     设 1 时把每次请求的**摘要**追加到 $GATEWAY_DIR/request_dump.jsonl（调试用，
+#                默认关）；可用 DUMP_REQ_FILE / DUMP_REQ_CHARS 改路径与预览长度。
 #   GATEWAY_DIR  本脚本与网关所在目录；默认 = 脚本自己所在目录
 #   B            后端二进制名；默认 ./rknn_multicard_demo.serve（由 build_serve.sh 产出）
 #   NSESSION     会话数 = **同时活跃的对话数上限**；默认 4。真实上限由内存账决定
@@ -74,6 +78,7 @@ GATEWAY_DIR=${GATEWAY_DIR:-$(cd "$(dirname "$0")" && pwd)}
 REPO_ROOT=${REPO_ROOT:-$(cd "$GATEWAY_DIR/.." && pwd)}
 INSTALL_DIR=${INSTALL_DIR:-$REPO_ROOT/install/rknn_multicard_demo}
 MODEL_DIR=${MODEL_DIR:-$REPO_ROOT/Qwen3.5-27B}
+MODEL_PREFIX=${MODEL_PREFIX:-Qwen3.5-27B-llm}   # 权重/分词器文件名前缀（换模型时改这个，不必改脚本）
 B=${B:-./rknn_multicard_demo.serve}
 NSESSION=${NSESSION:-4}
 IDLE_TTL=${IDLE_TTL:-300}
@@ -117,7 +122,7 @@ LOG=$(_abspath "$LOG")
 # 判据从 rope 外置张量的大小反推上下文 N，不解析 JSON：每个位置 256 字节 + 432 字节头
 # （8192 → 2097584 B、32768 → 8389040 B，实测）。读不到就**不拦**（可能是别的命名/别的
 # 模型），只在能算出来的时候说话。
-ROPE=${ROPE:-$MODEL_DIR/Qwen3.5-27B-llm_seg0.safetensors}
+ROPE=${ROPE:-$MODEL_DIR/${MODEL_PREFIX}_seg0.safetensors}
 MAXSESS=""
 if [ -f "$ROPE" ]; then
   BYTES=$(stat -c%s "$ROPE" 2>/dev/null || echo 0)
@@ -166,6 +171,12 @@ CORS_ARG=""
 # 保持"不落盘"的原行为。建议指向 tmpfs（如 /dev/shm/rknn-kv）以免写闪存。
 KV_SWAP_ARG=""
 [ -n "${KV_SWAP_DIR:-}" ] && KV_SWAP_ARG="--kv-swap-dir $KV_SWAP_DIR"
+[ -n "${KV_SWAP_CAP:-}" ] && KV_SWAP_ARG="$KV_SWAP_ARG --kv-swap-cap $KV_SWAP_CAP"
+[ -n "${KV_SWAP_MAX_MB:-}" ] && KV_SWAP_ARG="$KV_SWAP_ARG --kv-swap-max-mb $KV_SWAP_MAX_MB"
+
+# 实验开关（默认关）：KV_SINGLE_SEG=N 时 KV 存/取**只对 stage N** 生效（A4 实验用）。
+KV_SINGLE_SEG_ARG=""
+[ -n "${KV_SINGLE_SEG:-}" ] && KV_SINGLE_SEG_ARG="--kv-single-seg $KV_SINGLE_SEG"
 
 # 改动 B：单条 tool 结果的字节上限（可选，网关默认 8192）。设 0 = 关闭截断。
 TOOL_ARG=""
@@ -178,6 +189,7 @@ WINDOW_ARG=""
 # 调度策略：fcfs 也显式传（进程表上一眼能看出跑的是哪种），其余三个只有设了才传。
 SCHED_ARG="--sched-policy $SCHED_POLICY"
 [ -n "${SCHED_WEIGHTS:-}" ] && SCHED_ARG="$SCHED_ARG --sched-weights $SCHED_WEIGHTS"
+[ -n "${SCHED_COST:-}" ] && SCHED_ARG="$SCHED_ARG --sched-cost $SCHED_COST"
 [ -n "${SCHED_LONG_TOKENS:-}" ] && SCHED_ARG="$SCHED_ARG --sched-long-tokens $SCHED_LONG_TOKENS"
 [ -n "${SCHED_LONG_MAX:-}" ] && SCHED_ARG="$SCHED_ARG --sched-long-max $SCHED_LONG_MAX"
 
@@ -189,10 +201,10 @@ exec taskset f0 python3 "$GATEWAY_DIR/rkllm_gateway.py" \
   --queue-timeout "$QUEUE_TIMEOUT" \
   --backend-log "$LOG" \
   -- "$B" \
-     --model "$MODEL_DIR/Qwen3.5-27B-llm_seg0.rknn" \
-     --weight "$MODEL_DIR/Qwen3.5-27B-llm_seg0.weight" \
-     --vocab "$MODEL_DIR/Qwen3.5-27B-llm.tokenizer.gguf" \
-     --embed "$MODEL_DIR/Qwen3.5-27B-llm.embed.bin" \
+     --model "$MODEL_DIR/${MODEL_PREFIX}_seg0.rknn" \
+     --weight "$MODEL_DIR/${MODEL_PREFIX}_seg0.weight" \
+     --vocab "$MODEL_DIR/${MODEL_PREFIX}.tokenizer.gguf" \
+     --embed "$MODEL_DIR/${MODEL_PREFIX}.embed.bin" \
      --ctx-size "$CTX" --core-mask 0xff --stage-count 4 --bucket-size 128 \
-     --rope-tensor "$MODEL_DIR/Qwen3.5-27B-llm_seg0.safetensors" \
-     --sessions "$NSESSION" --serve -n "$NP"
+     --rope-tensor "$MODEL_DIR/${MODEL_PREFIX}_seg0.safetensors" \
+     --sessions "$NSESSION" --serve -n "$NP" $KV_SINGLE_SEG_ARG
