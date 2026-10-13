@@ -53,6 +53,10 @@ static size_t g_stage_count = 2;
 static uint64_t g_bucket_size = 128;
 static bool g_verbose = false;
 static bool g_ignore_eos = false;
+// 实验开关（默认关）：--kv-single-seg N（>=0）时，KV 存/取**只对 stage N** 生效。
+// 用于 A4"缺一不可"的可证伪实验——只恢复一段（其余层无 KV）应当输出错乱；
+// -1 = 关，行为与改造前逐字节一致。
+static int g_kv_single_seg = -1;
 static bool g_interactive = false;
 static bool g_performance_mode = false;
 static bool g_tensor_dump_enabled = false;
@@ -1096,6 +1100,8 @@ struct CommandLineOptions
   bool        has_sessions = false;
   // --rounds M：并发模式下每个会话跑 M 轮（首轮用 --prompt，后续轮用 chat 模板追加）。
   int         rounds = 1;
+  // --kv-single-seg N：实验开关；>=0 时只对 stage N 做 KV 存/取（默认 -1=关）。
+  int         kv_single_seg = -1;
 
   bool     performance_mode = false;
   uint64_t performance_input_length = 0;
@@ -1302,6 +1308,16 @@ static bool parse_named_command_line(int argc, char** argv, CommandLineOptions* 
         return false;
       }
       options->has_bucket_size = true;
+    } else if (strcmp(arg, "--kv-single-seg") == 0) {
+      // 实验开关：允许 0（stage 0），故不能用 parse_positive_i32。
+      if (!take_option_value(argc, argv, &i, arg, &value)) return false;
+      char* end = nullptr;
+      long  parsed = strtol(value, &end, 10);
+      if (end == value || *end != '\0' || parsed < 0) {
+        printf("%s requires a non-negative integer\n", arg);
+        return false;
+      }
+      options->kv_single_seg = (int)parsed;
     } else if (strcmp(arg, "--prompt") == 0) {
       if (!take_option_value(argc, argv, &i, arg, &options->prompt)) return false;
     } else if (strcmp(arg, "-n") == 0 || strcmp(arg, "--predict") == 0 ||
@@ -1892,6 +1908,29 @@ static int result_callback(void* userdata, RKLLMResult* result, LLMCallState sta
   return 0;
 }
 
+// ============================================================================
+// 投机解码可行性探针（默认关闭）：数"一次 session_run 里 sampling_callback 触发几次"。
+// 判断 SDK 能否在一次前向中逐位置给出 logits（投机解码并行校验的前提）。
+// ============================================================================
+static std::atomic<int> g_probe_sampling_calls{0};
+static int              g_probe_sampling_vocab = 0;
+
+static int probe_sampling_callback(void* userdata, float16* logits, char* logits_name) {
+  (void)userdata;
+  (void)logits_name;
+  int best = 0;
+  if (logits && g_probe_sampling_vocab > 0) {
+    float bv = -3.4e38f;
+    for (int i = 0; i < g_probe_sampling_vocab; ++i) {
+      float v = fp16_to_fp32(logits[i]);
+      if (v > bv) { bv = v; best = i; }
+    }
+  }
+  int n = g_probe_sampling_calls.fetch_add(1) + 1;
+  fprintf(stderr, "[probe-sampling] call=%d argmax=%d vocab=%d\n", n, best, g_probe_sampling_vocab);
+  return best;
+}
+
 static int stage_output_callback(void* userdata, rknn3_tensor* output_tensors, uint32_t n_output_tensors, LLMOutputCallbackState state)
 {
   auto* cb_ctx = reinterpret_cast<StageCallbackContext*>(userdata);
@@ -2355,6 +2394,28 @@ static bool init_stage_context(StageContext& stage, size_t stage_idx, const char
   stage.vocab_size = (int32_t)llm_cfg.vocab_size;
   stage.max_ctx_len = (int32_t)llm_cfg.max_ctx_len;
 
+  // E3：纯查询打印 KV 配置（dtype/档位组）。**仅**在 --verbose 或设了 KVCFG 时输出——
+  // 默认零输出，保证回归路径的启动输出逐字节不变。不建额外 session，无压死卡风险。
+  if (g_verbose || getenv("KVCFG") != nullptr) {
+    printf("[kvcfg] %s dtype=%d store_method=%d group_size=%u residual_depth=%u "
+           "max_ctx_len=%u\n",
+           stage.name.c_str(), (int)llm_cfg.kvcache_dtype,
+           (int)llm_cfg.kvcache_store_method, llm_cfg.kvcache_group_size,
+           llm_cfg.kvcache_residual_depth, llm_cfg.max_ctx_len);
+    for (uint32_t a = 0; a < llm_cfg.n_attention_kvcache_lens
+                         && a < RKNN3_MAX_ATTENTION_TYPE_NUM; ++a) {
+      printf("[kvcfg] %s attn[%u] type=%d n_lens=%u lens:", stage.name.c_str(), a,
+             (int)llm_cfg.attention_kvcache_lens[a].attention_type,
+             llm_cfg.attention_kvcache_lens[a].n_kvcache_buffer_lens);
+      for (uint32_t l = 0;
+           l < llm_cfg.attention_kvcache_lens[a].n_kvcache_buffer_lens
+               && l < RKNN3_MAX_KVCACHE_LEN_GROUPS; ++l) {
+        printf(" %d", llm_cfg.attention_kvcache_lens[a].kvcache_buffer_lens[l]);
+      }
+      printf("\n");
+    }
+  }
+
   if (init_output_tensors(stage) != 0) {
     printf("[%s] init output tensors failed\n", stage.name.c_str());
     destroy_context(stage);
@@ -2432,6 +2493,13 @@ static bool init_conversation(const std::vector<StageContext>& stages, Conversat
   callback.embed_userdata = &sess.embed_ctx;
   callback.result_callback = result_callback;
   callback.result_userdata = &conv.result;
+
+  // 投机解码可行性探针（默认关）：PROBE_SAMPLING=1 时挂自定义采样回调，数触发次数。
+  if (getenv("PROBE_SAMPLING") != nullptr) {
+    g_probe_sampling_vocab = stage.vocab_size;
+    callback.sampling_callback = probe_sampling_callback;
+    callback.sampling_userdata = nullptr;
+  }
 
   // 如果提供了 safetensors (rope caches)，则注册 input_callback 并设置 ext input indices
   if (input_cb_data && input_cb_data->rope_mmap_base) {
@@ -2884,6 +2952,9 @@ static bool save_conversation_kvcache(std::vector<StageContext>& stages, Convers
                                       const std::string& path)
 {
   for (size_t i = 0; i < stages.size(); ++i) {
+    if (g_kv_single_seg >= 0 && (int)i != g_kv_single_seg) {
+      continue;   // 实验开关：只存 stage N（默认关）
+    }
     std::lock_guard<std::mutex> card_lock(stages[i].run_mutex);
     if (!conv.stages[i].session) {
       return false;
@@ -2900,6 +2971,9 @@ static bool load_conversation_kvcache(std::vector<StageContext>& stages, Convers
                                       const std::string& path)
 {
   for (size_t i = 0; i < stages.size(); ++i) {
+    if (g_kv_single_seg >= 0 && (int)i != g_kv_single_seg) {
+      continue;   // 实验开关：只取 stage N（默认关）
+    }
     std::lock_guard<std::mutex> card_lock(stages[i].run_mutex);
     if (!conv.stages[i].session) {
       return false;
@@ -4859,6 +4933,7 @@ int main(int argc, char** argv)
   int max_new_tokens = options.max_new_tokens;
   g_verbose = options.verbose;
   g_ignore_eos = options.ignore_eos;
+  g_kv_single_seg = options.kv_single_seg;
   const char* rope_path = options.rope_path;
 
   if (options.tensor_dump_dir && !configure_tensor_dump(options.tensor_dump_dir)) {
