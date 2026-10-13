@@ -58,7 +58,19 @@ from toolcalls import (ToolCallExtractor, normalize_tool_calls, render_assistant
                        tool_response_block)
 from toolcalls import selftest as toolcalls_selftest
 
-MODEL_ID = "qwen3.5-27b"
+MODEL_ID = os.environ.get("MODEL_ID", "qwen3.5-27b")   # 展示用（/health、/v1/models）；可用 MODEL_ID 环境变量覆盖
+
+# ---- 请求转储（调试用，默认关）----
+# DUMP_REQ=1 时把每次 /v1/chat/completions 的**摘要**追加到 jsonl，用来回答"客户端到底发了什么"
+# （例如 Claude Code 并发发的那个无工具小请求是什么、本轮调了哪些工具）。
+# 只写摘要：每条消息的 role/长度/前 DUMP_REQ_CHARS 个字符 + 工具名清单；不写全量正文。
+DUMP_REQ = os.environ.get("DUMP_REQ", "") not in ("", "0", "false", "False", "no")
+DUMP_REQ_FILE = os.environ.get("DUMP_REQ_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "request_dump.jsonl")
+try:
+    DUMP_REQ_CHARS = int(os.environ.get("DUMP_REQ_CHARS") or 400)
+except ValueError:
+    DUMP_REQ_CHARS = 400
 BACKEND_READY_TIMEOUT = 900.0     # 模型加载约 230-240s，留足余量
 REQUEST_TIMEOUT = 1800.0          # 单轮最长等待（长上下文 prefill 很慢）
 DEFAULT_MAX_NEW_TOKENS = 512
@@ -1175,16 +1187,41 @@ def _key_label(key):
     return key if len(key) <= 24 else key[:21] + "..."
 
 
-class Lease(object):
-    __slots__ = ("session", "sent_prompt", "base", "reset", "key", "waited")
+# ③ 请求头信号解析（可选，非法一律回默认，绝不因头写错而 500）
+def _hdr_int(v, default):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
-    def __init__(self, session, sent_prompt, base, reset, key=None, waited=0.0):
+
+def _hdr_float(v, default):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _hdr_deadline(v):
+    """`X-Deadline-Ms`：绝对 epoch 毫秒。空/非法/非正 -> None（EDF 退回默认 TTFT 目标）。"""
+    try:
+        ms = float(v)
+        return ms / 1000.0 if ms > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+class Lease(object):
+    __slots__ = ("session", "sent_prompt", "base", "reset", "key", "waited", "swapped")
+
+    def __init__(self, session, sent_prompt, base, reset, key=None, waited=0.0, swapped=False):
         self.session = session
         self.sent_prompt = sent_prompt
         self.base = base            # acquire 时该会话已知的文本（reset 时为 ""）
         self.reset = reset
         self.key = key              # 这段对话的身份，release 时要靠它续期
         self.waited = waited        # 排队等了多久（0 = 没等）
+        self.swapped = swapped      # 本轮是否从 /dev/shm **冷读回**（改动 C）；供 X-KV-Reuse 回报
 
 
 class SessionPool(object):
@@ -1205,7 +1242,8 @@ class SessionPool(object):
                  kv_swap_dir=None, kv_swap_cap=DEFAULT_KV_SWAP_CAP,
                  kv_swap_max_mb=DEFAULT_KV_SWAP_MAX_MB,
                  sched_policy="fcfs", sched_weights=None,
-                 sched_long_tokens=None, sched_long_max=None):
+                 sched_long_tokens=None, sched_long_max=None,
+                 sched_cost="full"):
         self.backend = backend
         self.n = backend.sessions
         self.cv = threading.Condition()
@@ -1225,6 +1263,11 @@ class SessionPool(object):
         self.contend_idle = float(contend_idle or 0)
         self.queue_timeout = float(queue_timeout)
         self.reaped = 0          # 累计回收了几次（观测用）
+        # 除 MLFQ 外的优先级策略所需的额外观测量（见 mlfq_sched.pick）：
+        #   served    已完成轮数（LAS/Stride 的"已获服务"）
+        #   ttft_target_s  TTFT 目标（EDF 的截止期 = 入队时刻 + 它）
+        self.served = {}
+        self.ttft_target_s = float(os.environ.get("SCHED_TTFT_TARGET_S", "30") or 30)
         # bound 的上限：键是"system + 首条 user"的摘要或被回收之前攒下的对话。有了空闲
         # 回收，正常情况这张表只装活跃对话；这个上限只是长期运行的安全网——丢绑定只影响
         # 速度，不影响正确性。
@@ -1244,6 +1287,11 @@ class SessionPool(object):
         self.swap_bytes = 0      # 盘上换页文件总字节（按记录 size 累加）
         self.swap_in_total = 0
         self.swap_out_total = 0
+        # E1a：最近一次换页的耗时与带宽（供 /v1/pool 观测；未发生为 None）。
+        self.last_swap_out_ms = None
+        self.last_swap_out_mb_s = None
+        self.last_swap_in_ms = None
+        self.last_swap_in_mb_s = None
         backend.on_clear = self._on_clear
         # ---- 调度策略（2026-09-29 加）----
         # `fcfs`（默认）= 与改造前**逐字节一致**的行为：会话空出来时，等待者谁先被条件
@@ -1251,6 +1299,9 @@ class SessionPool(object):
         # 的候选打分（五因子，全部可观测近似），只让得分最高的那个拿走——见 mlfq_sched.py。
         # 这一层**只决定"派给谁"**：不改变任何请求语义，也不动 KV 记账（known[]/bound[]）。
         self.sched_policy = (sched_policy or "fcfs").lower()
+        # 成本口径（2026-10 加）：cp 用"整段 prompt"还是"增量"。delta = 整段×(1−pf)，
+        # 即复用后真正要 prefill 的部分——多轮 Agent 下更贴合真实成本。
+        self.sched_cost = (sched_cost or "full").lower()
         self.sched_weights = (mlfq_sched.parse_weights(sched_weights)
                               if sched_weights is not None else mlfq_sched.DEFAULT_WEIGHTS)
         self.sched_long_tokens = (float(sched_long_tokens) if sched_long_tokens
@@ -1330,14 +1381,21 @@ class SessionPool(object):
                   % (self.kv_swap_dir, free / 1e6, _key_label(key), session))
             return False
         path = self._swap_path(key)
+        _t0 = time.time()
         if not self.backend.save_kvcache(session, path):
             _note("换页失败（存）：%s s%d -> %s" % (_key_label(key), session, path))
             return False
+        _out_ms = (time.time() - _t0) * 1e3
         old = self.swapped.pop(key, None)
         if old is not None:
             self.swap_bytes -= old.get("size", 0)
             self._unlink_swap(old["path"])
         size = self._swap_bytes_on_disk(path)
+        _out_mb = size / 1e6
+        self.last_swap_out_ms = round(_out_ms, 1)
+        self.last_swap_out_mb_s = round(_out_mb / (_out_ms / 1e3), 1) if _out_ms > 0 else None
+        _note("[swap] out %s s%d %.1fMB %.0fms => %.0fMB/s"
+              % (_key_label(key), session, _out_mb, _out_ms, self.last_swap_out_mb_s or 0))
         self.swapped[key] = {"path": path, "known": known, "size": size}
         self.swap_bytes += size
         self.swap_out_total += 1
@@ -1378,10 +1436,17 @@ class SessionPool(object):
             return False
         self.swap_bytes -= rec.get("size", 0)
         n = self.backend.count(rec["known"])
+        _t0 = time.time()
         if not self.backend.load_kvcache(session, rec["path"], n or 0):
             _note("换页失败（读）：%s -> s%d，退回全量重算" % (_key_label(key), session))
             self._unlink_swap(rec["path"])
             return False
+        _in_ms = (time.time() - _t0) * 1e3
+        _in_mb = rec.get("size", 0) / 1e6
+        self.last_swap_in_ms = round(_in_ms, 1)
+        self.last_swap_in_mb_s = round(_in_mb / (_in_ms / 1e3), 1) if _in_ms > 0 else None
+        _note("[swap] in %s s%d %.1fMB %.0fms => %.0fMB/s"
+              % (_key_label(key), session, _in_mb, _in_ms, self.last_swap_in_mb_s or 0))
         # 已经读回内存（KV 重新驻留 NPU），盘上这份就没用了，删掉腾空间。
         self._unlink_swap(rec["path"])
         self.known[session] = rec["known"]
@@ -1441,12 +1506,11 @@ class SessionPool(object):
         self.waiting.pop(key, None)
         self.wait_req.pop(key, None)
 
-    def _mlfq_pick(self, best, now):
-        """MLFQ：给"会拿走 `best` 这个空闲会话"的候选打分，返回 (key|None, why)。
+    def _sched_pick(self, best, now):
+        """按 self.sched_policy 选一个候选（策略表见 mlfq_sched.pick）。
 
-        候选要排除**有主、正在等自己会话**的对话：它们不参与这个空闲会话的分配
-        （见 acquire 里 `cand is not None` 那条分支），把它们算进来会平白拉低别人的相对分。
-        五个因子全部是可观测近似，映射表见 mlfq_sched.py 的模块注释。
+        候选排除**有主、正在等自己会话**的对话（见 acquire 里 `cand is not None` 分支）。
+        统一信号：cp(估算算力) cr sa(等待) pf(前缀) tl(工具空闲) svc(已获服务) dl(截止期 slack)。
         """
         cands = []
         for k, t in list(self.waiting.items()):
@@ -1456,20 +1520,34 @@ class SessionPool(object):
             b = self.bound.get(k)
             if b is not None and not self.dead[b]:
                 continue
+            pf = mlfq_sched.prefix_ratio(rec["head"], self.known[best])
+            est = rec["est"]
+            # 成本口径：full=整段；delta=复用后真正要 prefill 的增量（+ 本轮 max_new）。
+            # 复用来源有二：① 与候选会话前缀重合 pf；② **该对话自身的 KV 还在**（`k in swapped`
+            # => 冷读回，prefill≈增量）。只按 pf 会漏掉②（调度时 best 多为干净会话）。
+            reuse = pf
+            if k in self.swapped:
+                reuse = 1.0
+            cp = (est * (1.0 - reuse)) if self.sched_cost == "delta" else est
             cands.append({
                 "key": k,
-                "cp": rec["est"] + rec["max_new"],          # 本轮估算算力
+                "cp": cp + rec["max_new"],                   # 本轮估算算力
                 "cr": 0.0,                                   # 端侧不可观测（见模块注释）
                 "sa": max(0.0, now - t),                     # 饥饿避免：等待时长
-                "pf": mlfq_sched.prefix_ratio(rec["head"], self.known[best]),
+                "pf": pf,
                 "tl": mlfq_sched.tool_latency_proxy(now, self.last_used.get(k)),
+                "svc": float(self.served.get(k, 0)),          # 已完成轮数（LAS/Stride）
+                "dl": ((rec.get("deadline") or (t + self.ttft_target_s)) - now),  # 截止期 slack（EDF）
+                "cls": rec.get("cls", 0),                     # 优先级类（prio）
+                "wq": rec.get("wq", 1.0),                     # 权重（stride）
             })
-        return mlfq_sched.choose(cands, self.sched_weights, now,
-                                 max_inflight_long=self.sched_long_max,
-                                 long_tokens=self.sched_long_tokens,
-                                 long_inflight=len(self.long_busy))
+        return mlfq_sched.pick(self.sched_policy, cands, self.sched_weights, now,
+                               max_inflight_long=self.sched_long_max,
+                               long_tokens=self.sched_long_tokens,
+                               long_inflight=len(self.long_busy))
 
-    def acquire(self, key, prompt, timeout=None, max_new=None):
+    def acquire(self, key, prompt, timeout=None, max_new=None,
+                cls=0, wq=1.0, deadline=None):
         """返回 Lease；排队超过 timeout 仍拿不到就抛 BackendError。
 
         **不抢占**：所有会话都被别的对话绑着时，这里只等，不把谁的会话夺过来。
@@ -1544,15 +1622,16 @@ class SessionPool(object):
                         # 默认 fcfs 不进这里（行为与改造前逐字节一致，见 mlfq_sched 注释）。
                         # `winner is None` = 长任务已到并发上限、而候选全是长任务：谁都别派。
                         take = True
-                        if self.sched_policy == "mlfq" and len(self.waiting) > 1:
-                            winner, _why = self._mlfq_pick(best, now)
+                        if self.sched_policy != "fcfs" and len(self.waiting) > 1:
+                            winner, _why = self._sched_pick(best, now)
                             take = (winner == key)
                         if take:
                             # 改动 C：这段对话之前被换出过，且拿到的会话是干净的 => 读回 KV，
                             # 让 _make_lease 能按前缀只发增量（免一次全量 prefill）。
+                            did_swap = False
                             if (key is not None and key in self.swapped
                                     and not self.known[best]):
-                                self._swap_in(best, key)
+                                did_swap = self._swap_in(best, key)
                             # 长任务限流记账：本轮估算 prompt 超阈值就占一个名额，跑完释放。
                             req = self.wait_req.get(key) or {}
                             if (req.get("est", 0.0) + req.get("max_new", 0)
@@ -1577,7 +1656,9 @@ class SessionPool(object):
                                     oldest = next(iter(self.bound))
                                     self.bound.pop(oldest)
                                     self.last_used.pop(oldest, None)
-                            return self._make_lease(best, prompt, t_enter, key)
+                            _lease = self._make_lease(best, prompt, t_enter, key)
+                            _lease.swapped = bool(did_swap)   # 本轮是否从 /dev/shm 冷读回
+                            return _lease
                         # 不是最高分（或全员被长任务限流）：不派发，落到下面的
                         # deadline 判断与排队等待，等下一次机会。这里**不能**用 continue——
                         # 那会跳过 deadline，让排队超时失效。
@@ -1602,6 +1683,10 @@ class SessionPool(object):
                         "head": prompt[:131072],
                         "est": mlfq_sched.estimate_prompt_tokens(prompt),
                         "max_new": int(max_new or 0),
+                        # ③ 请求头信号（可选）：优先级类 / 权重 / 截止期（epoch 秒）。
+                        "cls": int(cls or 0),
+                        "wq": float(wq or 1.0),
+                        "deadline": float(deadline) if deadline else None,
                     }
                     _note("进入排队：%s 等空闲会话（当前 %d/%d 被占，"
                                           "队列 %d 人）"
@@ -1719,9 +1804,16 @@ class SessionPool(object):
                 "reaped_total": self.reaped,
                 # 改动 C：换页观测（关闭换页时恒为 0/0/0）
                 "swapped": len(self.swapped),
+                # 冷会话的身份标签（供演示页把"历史对话"标成活跃/冷）
+                "swapped_keys": [_key_label(k) for k in self.swapped],
                 "swap_bytes": self.swap_bytes,
                 "swap_out_total": self.swap_out_total,
                 "swap_in_total": self.swap_in_total,
+                # E1a：最近一次换页的耗时/带宽（MB/s），未发生为 None。
+                "last_swap_out_ms": self.last_swap_out_ms,
+                "last_swap_out_mb_s": self.last_swap_out_mb_s,
+                "last_swap_in_ms": self.last_swap_in_ms,
+                "last_swap_in_mb_s": self.last_swap_in_mb_s,
                 "slots": slots,
                 "waiting": waiting,
             }
@@ -1762,6 +1854,7 @@ class SessionPool(object):
                 self.wait_req.pop(lease.key, None)
                 if lease.key in self.bound:
                     self.last_used[lease.key] = time.time()
+                    self.served[lease.key] = self.served.get(lease.key, 0) + 1
             self.cv.notify_all()
 
     def release(self, lease, generated_text, was_cleared):
@@ -1795,6 +1888,7 @@ class SessionPool(object):
                 self.wait_req.pop(lease.key, None)
                 if lease.key in self.bound:
                     self.last_used[lease.key] = time.time()
+                    self.served[lease.key] = self.served.get(lease.key, 0) + 1
             self.cv.notify_all()
 
 
@@ -1902,6 +1996,58 @@ def conversation_key(messages, explicit=None):
         return None
     h = hashlib.sha1(("%s\x00%s" % (sys_text, first_user)).encode("utf-8"))
     return "h:" + h.hexdigest()[:16]
+
+
+def dump_request(req, key, prompt, max_new, tools, stream):
+    """把一次请求的摘要写一行 JSONL（调试客户端行为用；默认关，见 DUMP_REQ）。
+
+    写什么：时间、对话身份、是否流式、max_new、渲染后 prompt 字节数、消息条数、
+    每条消息的 role/字符数/（system、user 的前 N 字符预览）/tool_calls 名、工具名清单。
+    为什么只写摘要：正文可能很大、也可能含敏感内容；摘要足够回答"这一路是主请求还是后台
+    辅助调用""本轮调了哪个工具"这类问题。
+    """
+    if not DUMP_REQ:
+        return
+
+    def _chars(x):
+        try:
+            return len(_content_text(x) or "")
+        except Exception:                                       # noqa: BLE001
+            return 0
+
+    msgs = []
+    for m in (req.get("messages") or []):
+        if not isinstance(m, dict):
+            continue
+        item = {"role": m.get("role"), "chars": _chars(m.get("content"))}
+        if m.get("tool_calls"):
+            item["tool_calls"] = [((tc.get("function") or {}).get("name")
+                                   if isinstance(tc, dict) else None)
+                                  for tc in m["tool_calls"]]
+        if m.get("tool_call_id"):
+            item["tool_call_id"] = m.get("tool_call_id")
+        if m.get("role") in ("system", "user"):
+            try:
+                item["preview"] = (_content_text(m.get("content")) or "")[:DUMP_REQ_CHARS]
+            except Exception:                                   # noqa: BLE001
+                item["preview"] = ""
+        msgs.append(item)
+    rec = {
+        "t": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "key": key,
+        "stream": bool(stream),
+        "max_new": max_new,
+        "prompt_bytes": len(prompt.encode("utf-8")),
+        "n_msgs": len(msgs),
+        "tools": [((t.get("function") or {}).get("name") if isinstance(t, dict) else None)
+                  for t in (tools or [])],
+        "messages": msgs,
+    }
+    try:
+        with open(DUMP_REQ_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:                                           # noqa: BLE001
+        pass
 
 
 def _drop_unit_bounds(msgs, start):
@@ -2454,6 +2600,18 @@ class Gateway(object):
                 "dead": sum(1 for s in pool["slots"] if s["state"] == "dead"),
                 "waiting": len(pool["waiting"]),
                 "uptime_s": round(time.time() - self.started_at, 1),
+                # KV 换页观测（改动 C / E1a）：冷会话数、换页存储字节、累计与最近一次耗时/带宽。
+                "swapped": pool.get("swapped"),
+                "swapped_keys": pool.get("swapped_keys"),
+                "swap_bytes": pool.get("swap_bytes"),
+                # 活跃会话的身份标签（来自 pool.slots[].key）；与 swapped_keys 一起标注历史条目状态。
+                "active_keys": [s.get("key") for s in pool.get("slots", []) if s.get("key")],
+                "swap_out_total": pool.get("swap_out_total"),
+                "swap_in_total": pool.get("swap_in_total"),
+                "last_swap_out_ms": pool.get("last_swap_out_ms"),
+                "last_swap_out_mb_s": pool.get("last_swap_out_mb_s"),
+                "last_swap_in_ms": pool.get("last_swap_in_ms"),
+                "last_swap_in_mb_s": pool.get("last_swap_in_mb_s"),
             },
         }
 
@@ -2834,11 +2992,16 @@ class Handler(BaseHTTPRequestHandler):
                          len(tools),
                          ("; window dropped %d msgs" % dropped) if dropped else "",
                          ("; tools %s" % tool_mode) if tool_mode != "full" else "")
+        dump_request(req, key, prompt, max_new, tools, stream)
 
         lease = None
         q = None
         try:
-            lease = self.gateway.pool.acquire(key, prompt, max_new=max_new)
+            lease = self.gateway.pool.acquire(
+                key, prompt, max_new=max_new,
+                cls=_hdr_int(self.headers.get("X-Priority"), 0),
+                wq=_hdr_float(self.headers.get("X-Weight"), 1.0),
+                deadline=_hdr_deadline(self.headers.get("X-Deadline-Ms")))
             q = self.gateway.backend.submit(prompt=lease.sent_prompt,
                                             max_new_tokens=max_new,
                                             session=lease.session,
@@ -2847,10 +3010,11 @@ class Handler(BaseHTTPRequestHandler):
                     "sent": len(lease.sent_prompt.encode("utf-8")),
                     "base": len(lease.base.encode("utf-8")),
                     "full": len(prompt.encode("utf-8")),
+                    "swapped": 1 if getattr(lease, "swapped", False) else 0,
                     "wait": lease.waited}
-            self.gateway.log("lease: session=%d reset=%s sent=%d/%d bytes (base=%d)%s",
+            self.gateway.log("lease: session=%d reset=%s sent=%d/%d bytes (base=%d swapped=%d)%s",
                              q.kv["session"], q.kv["reset"], q.kv["sent"], q.kv["full"],
-                             q.kv["base"],
+                             q.kv["base"], q.kv["swapped"],
                              # 排过队就一定要打出来：**"慢"和"没轮到"在日志里必须分得开**，
                              # 否则事后只能靠 pool 快照的时间线去猜（见 CHANGELOG 09-18）。
                              (" 排队 %.1fs" % lease.waited) if lease.waited >= 0.05 else "")
@@ -3361,9 +3525,10 @@ def kv_reuse_headers(kv):
     """
     if not kv:
         return {}
-    return {"X-KV-Reuse": "session=%d; reset=%d; sent=%d; base=%d; full=%d; wait=%.1f"
+    return {"X-KV-Reuse": "session=%d; reset=%d; sent=%d; base=%d; full=%d; swapped=%d; wait=%.1f"
                           % (kv["session"], 1 if kv["reset"] else 0, kv["sent"],
-                             kv["base"], kv["full"], kv.get("wait", 0.0))}
+                             kv["base"], kv["full"], 1 if kv.get("swapped") else 0,
+                             kv.get("wait", 0.0))}
 
 
 # ===========================================================================
@@ -4802,10 +4967,9 @@ def main():
                          "（退回「一定要等到 --idle-ttl」）"
                          % DEFAULT_CONTEND_IDLE)
     ap.add_argument("--sched-policy", default=os.environ.get("SCHED_POLICY", "fcfs"),
-                    choices=["fcfs", "mlfq"],
+                    choices=list(mlfq_sched.POLICIES),
                     help="会话分配策略。fcfs（默认）= 先到先得，行为与改造前逐字节一致；"
-                         "mlfq = 会话空出来时对排队者按五因子打分，只让最高分者拿走"
-                         "（因子都是端侧可观测近似，见 gateway/mlfq_sched.py）")
+                         "mlfq = 五因子加权；sjf/las/stride/edf/prio/prefix = 见 gateway/mlfq_sched.py")
     ap.add_argument("--sched-weights",
                     default=os.environ.get("SCHED_WEIGHTS", "0.4,0.3,0.15,0.1,0.05"),
                     help="mlfq 五因子权重 cp,cr,sa,pf,tl（默认沿用服务端 mlfq 那组）")
@@ -4816,6 +4980,10 @@ def main():
     ap.add_argument("--sched-long-max", type=int,
                     default=int(os.environ.get("SCHED_LONG_MAX", 0)) or None,
                     help="mlfq 长任务并发上限；默认 max(1, NSESSION//2)")
+    ap.add_argument("--sched-cost", default=os.environ.get("SCHED_COST", "full"),
+                    choices=["full", "delta"],
+                    help="调度成本口径：full=整段 prompt token（默认，行为不变）；"
+                         "delta=整段×(1−前缀复用比例)，更贴近真实 prefill 增量")
     ap.add_argument("--queue-timeout", type=float, default=DEFAULT_QUEUE_TIMEOUT,                    help="取不到会话时最多排队等这么多秒，超了返回 503。"
                          "默认 %.0f；应大于 --idle-ttl，否则会出现"
                          "「马上就要轮到了，请求却先超时」"
@@ -4897,16 +5065,19 @@ def main():
                        sched_policy=args.sched_policy,
                        sched_weights=args.sched_weights,
                        sched_long_tokens=args.sched_long_tokens,
-                       sched_long_max=args.sched_long_max)
+                       sched_long_max=args.sched_long_max,
+                       sched_cost=args.sched_cost)
     print("[gateway] 会话调度: 最多 %d 段对话同时活跃，多的排队；"
           "静默 %.0fs 回收（**有人在等时**降到 %.0fs，只收最闲的一段），"
           "排队 %.0fs 未轮到则返回 503"
           % (backend.sessions, pool.idle_ttl, pool.contend_idle,
              pool.queue_timeout), flush=True)
-    if pool.sched_policy == "mlfq":
-        print("[gateway] 分配策略: mlfq 权重=%s 长任务阈值=%d tok 并发上限=%d"
-              % (",".join("%g" % w for w in pool.sched_weights),
-                 int(pool.sched_long_tokens), pool.sched_long_max), flush=True)
+    if pool.sched_policy != "fcfs":
+        print("[gateway] 分配策略: %s · 成本口径=%s（长任务阈值=%d tok 并发上限=%d；策略表见 "
+              "gateway/mlfq_sched.py）"
+              % (pool.sched_policy, pool.sched_cost, int(pool.sched_long_tokens),
+                 pool.sched_long_max),
+              flush=True)
     else:
         print("[gateway] 分配策略: fcfs（先到先得，与改造前一致）", flush=True)
     try:
