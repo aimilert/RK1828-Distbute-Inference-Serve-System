@@ -134,6 +134,66 @@ def choose(cands, weights, now, max_inflight_long=None, long_tokens=None,
     return best["key"], "score=%.4f" % scores[best["key"]]
 
 
+# ============================================================================
+# 可插拔优先级策略（除 MLFQ 外）
+#
+# 说明：本栈是**非抢占、会话级**分配——只在"一个会话空出来、队列里不止一人等"时选谁先拿。
+# 因此这些策略主要改 **TTFT/公平性**，不改峰值吞吐（吞吐由流水线瓶颈决定）。
+# 统一候选字段（缺省有安全默认）：
+#   key, cp(估算算力), cr, sa(等待秒), pf(前缀亲和), tl(工具空闲代理)
+#   svc(已获服务量, LAS/Stride 用), dl(截止期 slack 秒, EDF 用), cls(优先级类, 越大越高), wq(权重)
+# ============================================================================
+POLICIES = ("fcfs", "mlfq", "sjf", "las", "stride", "edf", "prio", "prefix")
+
+
+def _c_flat(c, name, default=0.0):
+    v = c.get(name, default)
+    return default if v is None else v
+
+
+def pick(policy, cands, weights, now, max_inflight_long=None, long_tokens=None,
+         long_inflight=0):
+    """按策略选一个 key。语义与 choose() 一致（长任务限流 + 空集）。
+
+    · fcfs   : 等待最久优先（= MLFQ 权重全 0 的退化，作基线）
+    · mlfq   : 现有五因子加权（见 choose）
+    · sjf    : cp 最小（最短作业优先，均延迟最优；同分等更久者）
+    · las    : svc 最小（Least-Attained-Service：已获得服务最少者优先，重尾负载友好）
+    · stride : svc/wq 最小（加权公平：虚拟运行时间，按权重分份额）
+    · edf    : dl 最小（最近截止期优先；slack=deadline-now）
+    · prio   : cls 最大（严格优先级类；同分等更久者）
+    · prefix : pf 最大（前缀命中优先，省 prefill；同分等更久者）
+    """
+    if not cands:
+        return None, "empty"
+    pool = cands
+    if long_tokens is not None and max_inflight_long is not None:
+        allowed = [c for c in pool if c["cp"] <= long_tokens or long_inflight < max_inflight_long]
+        if not allowed:
+            return None, "long-throttled"
+        pool = allowed
+
+    p = (policy or "fcfs").lower()
+    if p == "mlfq":
+        return choose(pool, weights, now, max_inflight_long, long_tokens, long_inflight)
+    if p == "sjf":
+        best = min(pool, key=lambda c: (_c_flat(c, "cp"), -_c_flat(c, "sa")))
+    elif p == "las":
+        best = min(pool, key=lambda c: (_c_flat(c, "svc"), -_c_flat(c, "sa")))
+    elif p == "stride":
+        best = min(pool, key=lambda c: (_c_flat(c, "svc") / max(1e-9, _c_flat(c, "wq", 1.0)),
+                                        -_c_flat(c, "sa")))
+    elif p == "edf":
+        best = min(pool, key=lambda c: (_c_flat(c, "dl", 1e18), -_c_flat(c, "sa")))
+    elif p == "prio":
+        best = max(pool, key=lambda c: (_c_flat(c, "cls"), _c_flat(c, "sa")))
+    elif p == "prefix":
+        best = max(pool, key=lambda c: (_c_flat(c, "pf"), _c_flat(c, "sa")))
+    else:  # fcfs / 未知
+        best = max(pool, key=lambda c: (_c_flat(c, "sa"), c["key"]))
+    return best["key"], "policy=%s" % p
+
+
 def selftest(check):
     """纯逻辑自检（不碰网关、不碰后端）。"""
     now = 1000.0
@@ -184,3 +244,26 @@ def selftest(check):
     # 7) 权重解析
     check("权重解析", parse_weights("0.4,0.3,0.15,0.1,0.05") == (0.4, 0.3, 0.15, 0.1, 0.05))
     check("非法权重回默认", parse_weights("1,2") == DEFAULT_WEIGHTS)
+
+    # 8) 可插拔策略
+    w0 = (0.0, 0.0, 0.0, 0.0, 0.0)
+    C = [{"key": "L", "cp": 900, "cr": 0, "sa": 1, "pf": 0.0, "tl": 0,
+          "svc": 500, "dl": 9.0, "cls": 0, "wq": 1.0},
+         {"key": "S", "cp": 100, "cr": 0, "sa": 0, "pf": 0.0, "tl": 0,
+          "svc": 50, "dl": 2.0, "cls": 0, "wq": 1.0}]
+    check("fcfs 取等待最久(L)", pick("fcfs", C, w0, now)[0] == "L")
+    check("sjf 取 cp 最小(S)", pick("sjf", C, w0, now)[0] == "S")
+    check("las 取 svc 最小(S)", pick("las", C, w0, now)[0] == "S")
+    check("edf 取 slack 最小(S)", pick("edf", C, w0, now)[0] == "S")
+    check("prefix 取 pf 最大",
+          pick("prefix", [{"key": "a", "cp": 0, "sa": 0, "pf": 0.1},
+                          {"key": "b", "cp": 0, "sa": 0, "pf": 0.9}], w0, now)[0] == "b")
+    check("stride 按 svc/wq",
+          pick("stride", [{"key": "A", "cp": 0, "sa": 0, "svc": 100, "wq": 10.0},
+                          {"key": "B", "cp": 0, "sa": 0, "svc": 50, "wq": 1.0}], w0, now)[0] == "A")
+    check("prio 取高类",
+          pick("prio", [{"key": "lo", "cp": 0, "sa": 99, "cls": 0},
+                        {"key": "hi", "cp": 0, "sa": 0, "cls": 1}], w0, now)[0] == "hi")
+    check("长任务限流对 pick 同样生效",
+          pick("sjf", [{"key": "L", "cp": 20000, "sa": 1}], w0, now,
+               max_inflight_long=1, long_tokens=8192, long_inflight=1)[0] is None)
