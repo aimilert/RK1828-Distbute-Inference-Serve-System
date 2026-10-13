@@ -53,6 +53,19 @@ static size_t g_stage_count = 2;
 static uint64_t g_bucket_size = 128;
 static bool g_verbose = false;
 static bool g_ignore_eos = false;
+
+// 环境布尔开关：只有"明确不是关"才算开（""/"0"/"false"/"no" 都视为关）。
+// **不要**写成 `getenv(x) != nullptr`——那样 `PARALLEL_LOAD=0` 也会被当成开（实测踩过）。
+static bool env_flag(const char* name)
+{
+  const char* v = getenv(name);
+  if (v == nullptr || v[0] == '\0') { return false; }
+  if (strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "False") == 0 ||
+      strcmp(v, "no") == 0) {
+    return false;
+  }
+  return true;
+}
 // 实验开关（默认关）：--kv-single-seg N（>=0）时，KV 存/取**只对 stage N** 生效。
 // 用于 A4"缺一不可"的可证伪实验——只恢复一段（其余层无 KV）应当输出错乱；
 // -1 = 关，行为与改造前逐字节一致。
@@ -2435,7 +2448,7 @@ static bool init_stage_context(StageContext& stage, size_t stage_idx, const char
          stage.name.c_str(), stage.embedding_dim, stage.vocab_size, stage.max_ctx_len, stage.n_output_tensors);
   // 加载耗时拆解（LOAD_TIMING=1 或 --verbose）：用来判断"加载慢"是卡在哪一段。
   auto t_end = std::chrono::steady_clock::now();
-  if (g_verbose || getenv("LOAD_TIMING") != nullptr) {
+  if (g_verbose || env_flag("LOAD_TIMING")) {
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
       return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
     };
@@ -5115,7 +5128,9 @@ int main(int argc, char** argv)
   bool ok = true;
   // 实验开关：PARALLEL_LOAD=1 时用 4 个线程**同时**初始化 4 个 stage（各占一张卡、互相
   // 独立）。默认关（串行），保持与改造前逐字节一致的启动顺序。
-  const bool parallel_load = (getenv("PARALLEL_LOAD") != nullptr);
+  // 与串行的差别：并行时**四个 stage 都会尝试**（串行是"首个失败即 break"）；失败靠下面的
+  // 统一 `if(!ok)` 清理路径回收，不回滚已建好的 context（进程随后退出）。
+  const bool parallel_load = env_flag("PARALLEL_LOAD");
   auto t_loop0 = std::chrono::steady_clock::now();
   if (parallel_load && stages.size() > 1) {
     std::vector<std::thread> pool;
@@ -5124,9 +5139,15 @@ int main(int argc, char** argv)
       const char* device_id = ext_device_ids.empty() ? devs.devices[i].id
                                                      : ext_device_ids[i].c_str();
       pool.emplace_back([&, i, device_id]() {
-        oks[i] = init_stage_context(stages[i], i, device_id, model_paths[i].c_str(),
-                                    weight_paths[i].c_str(), run_core_mask,
-                                    &input_cb_data) ? 1 : 0;
+        // 线程里抛出的异常无法被主线程捕获（会直接 std::terminate、绕过 `oks`/清理路径），
+        // 所以就地接住、记成这一路失败。
+        try {
+          oks[i] = init_stage_context(stages[i], i, device_id, model_paths[i].c_str(),
+                                      weight_paths[i].c_str(), run_core_mask,
+                                      &input_cb_data) ? 1 : 0;
+        } catch (...) {
+          oks[i] = 0;
+        }
       });
     }
     for (auto& th : pool) { th.join(); }
@@ -5146,7 +5167,7 @@ int main(int argc, char** argv)
   auto t_loop1 = std::chrono::steady_clock::now();
   // 只在显式要看耗时（--verbose / LOAD_TIMING）或走并行实验开关时才打印，保证默认启动
   // 输出与改造前逐字节一致。
-  if (g_verbose || parallel_load || getenv("LOAD_TIMING") != nullptr) {
+  if (g_verbose || parallel_load || env_flag("LOAD_TIMING")) {
     printf("[load] init loop wall = %lld ms (parallel=%d)\n",
            (long long)std::chrono::duration_cast<std::chrono::milliseconds>(t_loop1 - t_loop0)
                .count(),
