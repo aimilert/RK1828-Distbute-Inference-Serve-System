@@ -316,12 +316,36 @@
           font-variant-numeric:tabular-nums; min-height:24px; }
   .stat b { color:var(--ok); }
   .hint { color:var(--dim); font-size:12px; }
+.btn-danger:hover:not(:disabled) { background:#3a1d22; color:var(--danger); }
+
+/* 历史对话覆盖层：fixed 定位，**不参与主布局**（底部七块等高、单屏布局都不受影响）。 */
+.histov { position:fixed; inset:0; z-index:50; background:rgba(6,8,12,.62);
+          display:flex; align-items:flex-start; justify-content:center; }
+.histov[hidden] { display:none; }
+.hpanel { margin-top:8vh; width:min(680px,92vw); max-height:78vh; overflow:hidden;
+          background:#161b26; border:1px solid #2a3345; border-radius:12px;
+          box-shadow:0 12px 48px rgba(0,0,0,.5); display:flex; flex-direction:column; }
+.hhead { display:flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid #2a3345; }
+.hhead b { font-size:14px; }
+.hsub { flex:1 1 auto; font-size:12px; color:var(--dim); }
+.hlist { overflow:auto; padding:6px 8px; }
+.hrow { display:flex; align-items:center; gap:10px; padding:8px; border-radius:8px; }
+.hrow:hover { background:#1e2534; }
+.hrow .ht { flex:1 1 auto; min-width:0; }
+.hrow .ht b { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.hrow .ht span { color:var(--dim); font-size:12px; }
+.hempty { padding:16px; color:var(--dim); }
+/* 历史条目的 KV 状态徽标：活跃（在会话里）/ 冷存（在 /dev/shm）/ —（已释放，不在池中） */
+.hst { padding:1px 6px; border-radius:6px; font-size:11px; white-space:nowrap; }
+.hst-a { background:#12351f; color:#6ee7a0; }
+.hst-c { background:#3a2f13; color:#e7c96e; }
+.hst-x { background:#2a2f3a; color:var(--dim); }
 </style>
 </head>
 <body>
 <header>
   <div class="brand">
-    <h1>多路并发推理 · Qwen3.5-27B · RK1828 ×4</h1>
+    <h1>多路并发推理 · <span id="modelName">Qwen3.5-27B</span> · RK1828 ×4</h1>
     <!-- 徽标里那句字是 JS 写的（setStatus），灯的颜色也是 JS 换的 -->
     <span id="status" class="badge idle"><i class="led"></i><span id="gstats">待机</span></span>
   </div>
@@ -333,6 +357,8 @@
     <button id="addwin" class="btn-secondary" title="新增一个对话窗口">＋ 加窗口</button>
     <button id="baseline" class="btn-secondary">① 先量单路基线</button>
     <button id="all" class="btn-primary">② 同时提问</button>
+    <button id="newconv" class="btn-secondary" title="把当前窗口开成一段**新对话**：旧对话留在网关里（闲置后换页冷存），可用来演示"多于会话数"的对话">🆕 新对话</button>
+    <button id="hist" class="btn-secondary" title="历史对话：保存在浏览器；重开沿用同一身份 → KV 复用 / 从 /dev/shm 冷读回">🕘 历史对话</button>
     <button id="clear" class="btn-danger">清空</button>
   </div>
 </header>
@@ -350,6 +376,18 @@
      所以不藏进弹窗。但**放在对话下面**：它要紧，却不该抢在回答前面（2026-09-20 挪的，
      原先它挤在标题正下方那一行里，第一眼看到的是"内存 60%"而不是模型答了什么）。 -->
 <section id="sys" class="syssec"></section>
+
+<!-- 历史对话覆盖层（fixed，不占布局）。重开沿用同一身份 → 命中 KV 复用，或被换页后冷读回。 -->
+<div id="histov" class="histov" hidden>
+  <div class="hpanel">
+    <div class="hhead"><b>历史对话</b>
+      <span class="hsub">重开沿用同一身份 → KV 复用 / 冷读回。「冷存」= 此刻在网关 /dev/shm 里、与历史条数不一定相等</span>
+      <button id="histclear" class="btn-secondary" title="清空历史，并交还这些对话占的会话">清空历史</button>
+      <button id="histclose" class="btn-secondary" aria-label="关闭">×</button>
+    </div>
+    <div id="histlist" class="hlist"></div>
+  </div>
+</div>
 
 <script>
 "use strict";
@@ -393,18 +431,15 @@ function maxtok() {
 // （v1.9 之前靠内容区分：网关按 `system + 首问` 认对话，两路问同一句话就会被当成
 // 同一段对话、落到同一个会话上排队——那是"轮流"，不是并发，而且答案全对、看不出来。）
 //
-// 为什么默认问题这么"机械"：这种列举型任务模型会**直接开始输出**，不会先写一大段
-// 思考过程。换成"介绍一下杭州"这类需要组织语言的问题，实测在关思考的软开关下
-// 仍会吐 <think>，而且常常在 think 段里就被 max_tokens 截断——网关此时按设计
-// **原样吐出**（宁可露标签也不静默吞内容），投影出来就是满屏 "Analyze the Request"。
-// 演示时当然可以随便问，只是默认这四问是挑过的。
-// 四个都挑过：实测 150~190 tok、13~17 秒、**都不吐 <think>**。时长接近是有意的——
-// 四路里最短的那路一下线，屏幕上就只剩三行在动，"四路同时"的画面只维持很短一段。
+// 默认四问：本页面用于**产品演示**，预置为项目的四个核心问题（可按需修改）。
+// 注意：这类"解释型"问题模型会先输出 `<think>` 推理段；若想屏幕更干净，可勾选"关思考"，
+// 或把输出上限调大，否则可能在 think 段被截断（网关按设计原样吐出标签）。
+// 四问互不相同即可（page_check 只校验这一点，不校验内容）。
 const DEFAULT_Q = [
-  "List the numbers from 1 to 40 separated by commas.",
-  "List the multiples of 5 from 5 to 200 separated by commas.",
-  "Count down from 50 to 1 separated by commas.",
-  "List the even numbers from 2 to 80 separated by commas.",
+  "什么是分布式流水线推理？",
+  "KVCache 是什么？KVCache 的换页卸载是用来优化什么的？",
+  "如何优化 Pipeline 中的 bubble 气泡，有哪些措施？",
+  "端侧 LLM 可以用来干什么？",
 ];
 
 const panels = [];
@@ -426,7 +461,20 @@ let nextUid = 1;               // 单调递增，**绝不复用**，理由见 ne
 // 窗口身份 `web-<n>` 必须是**一次性**的。删掉窗口 2 再加一个，如果新窗口又叫 `web-2`，
 // 网关会把它当成刚才那段对话（同一个 key）——新窗口的第一个问题会命中旧对话的 KV、
 // 还接着旧历史，现场看着就是"删了没删掉"。序号可以重排，身份不行。
-function newConvId() { return "web-" + (nextUid++); }
+//
+// **计数器持久化**（2026-10 修）：以前 `nextUid` 每次刷新从 1 重来，于是刷新后新面板的
+// `web-1/web-2` 会和 localStorage 里"历史对话"的旧 id 撞车 —— histUpsert 按 id 覆盖，
+// 旧历史被顶掉（表现为"历史对话数量不对/问过的对话丢记录"）。存进 localStorage 即可根治。
+const UID_KEY = "demo4chat.uid";
+try {
+  const _v = parseInt(localStorage.getItem(UID_KEY), 10);
+  if (_v > 0) { nextUid = _v; }
+} catch (e) {}
+function newConvId() {
+  const id = "web-" + (nextUid++);
+  try { localStorage.setItem(UID_KEY, String(nextUid)); } catch (e) {}
+  return id;
+}
 
 // 面板显示号（"面板 3"）在增删之后**重排**，但对话身份（convId）不动。
 // 序号是给眼睛看的，身份是给网关认对话的，两者一旦绑在一起，删掉中间那个窗口就会
@@ -655,6 +703,13 @@ function renderSys(d) {
   sysLastTs = d.ts;   // 记住画下去的这一份：下一拍若还是同一个 ts，连 DOM 都不动
   const host = d.host || {}, cpu = host.cpu || {}, mem = host.mem || {};
   const npu = d.npu || {}, be = d.backend || {}, gw = d.gateway || {};
+  // 记录网关此刻的活跃/冷会话身份（gateway.active_keys / swapped_keys），给"历史对话"标状态；
+  // 覆盖层开着时立刻重画一次，让"活跃/冷存/"的标注跟着换页实时变。
+  if (d.gateway && (d.gateway.active_keys || d.gateway.swapped_keys)) {
+    gwActive = {}; (d.gateway.active_keys || []).forEach(function (k) { gwActive[k] = 1; });
+    gwCold = {}; (d.gateway.swapped_keys || []).forEach(function (k) { gwCold[k] = 1; });
+    if (histOpen) { histRender(); }
+  }
   const blocks = [];
 
   // ---- RK3588：本机现读 ----
@@ -695,7 +750,20 @@ function renderSys(d) {
     sRow("数据", '<b class="' + (stale ? "warn" : "") + '">' +
                  (ageNum === null ? (alive ? "还没采到" : "—") : ageNum.toFixed(1) + "s 前") +
                  "</b>" + (stale ? "（后端没在答）" : ""));
-  if (typeof gw.uptime_s === "number") {
+  // 第 5 行：优先展示 **KV 换页**（冷会话 / 换页存储 / 最近一次 out 带宽）；换页关闭时退回
+  // "网关已跑"。**行数保持 5 行**：底部七块等高、服务块两列，多一行会挤动整条线。
+  if (typeof gw.swapped === "number" && (gw.swapped > 0 || Number(gw.swap_out_total) > 0)) {
+    const lastOut = (gw.last_swap_out_ms != null)
+      ? ' · out ' + Math.round(gw.last_swap_out_ms) + "ms" +
+        (gw.last_swap_out_mb_s != null ? "/" + Math.round(gw.last_swap_out_mb_s) + "MB/s" : "")
+      : "";
+    svc += sRow("换页",
+      tip("<b>" + gw.swapped + "</b> 冷",
+          "冷会话 = KV 已换页到 /dev/shm 的非活跃对话；同一身份回来时按前缀读回、免一次全量 prefill"
+          + "（累计 " + (gw.swap_out_total || 0) + " 存 / " + (gw.swap_in_total || 0) + " 取）") +
+      (gw.swap_bytes ? '<span class="m dim2"> · ' + fmtBytes(gw.swap_bytes) + "</span>" : "") +
+      (lastOut ? '<span class="m dim2">' + lastOut + "</span>" : ""));
+  } else if (typeof gw.uptime_s === "number") {
     svc += sRow("网关", '<span class="dim2">已跑 ' + fmtDur(gw.uptime_s) + "</span>");
   }
   // 五行排成两列（见 CSS 里 `.svc` 那段）：这一块原来是七块里最高的，等高之后整条线的高度
@@ -842,6 +910,16 @@ async function refreshHealth() {
     const h = await r.json();
     if (typeof h.sessions === "number" && h.sessions > 0) { MAX_SESSIONS = h.sessions; }
     if (typeof h.ctx_size === "number") { CTX_SIZE = h.ctx_size; }
+    // 标题里的模型名跟着后端走，不许写死（换模型后 /health.model 变了这里就变）。
+    // 后端给的是 id（如 qwen3.8-27b），这里只做首字母大写 + 结尾规格大写，纯粹为好看。
+    if (h.model) {
+      const mn = document.getElementById("modelName");
+      if (mn) {
+        mn.textContent = String(h.model)
+          .replace(/^([a-z])/, function (m) { return m.toUpperCase(); })
+          .replace(/(\d+)b\b/i, function (m, n) { return n + "B"; });
+      }
+    }
     capKnown = true;
   } catch (e) {
     /* 保持上一次的值（首次就是兜底值） */
@@ -1232,10 +1310,13 @@ async function send(p) {
                  + Math.max(0, r.el - r.waited).toFixed(1) + "s）" : "")
             + " · 会话 " + (kv.session !== undefined ? kv.session : "?")
             + (kv.full ? " · KV " + kv.sent + "/" + kv.full
-                       + (Number(kv.base) > 0
-                          ? "（复用 " + kv.base + "，省 "
+                       + (kv.swapped === "1"
+                          ? "（❄ 冷读回，省 "
                             + Math.round(100 * (1 - kv.sent / kv.full)) + "%）"
-                          : "（全量）") : "")
+                          : (Number(kv.base) > 0
+                             ? "（复用 " + kv.base + "，省 "
+                               + Math.round(100 * (1 - kv.sent / kv.full)) + "%）"
+                             : "（全量）")) : "")
             // 只在**字面**收到 length 时才标。别拿"tok 数 ≈ 设定值"去猜：后端在上下文
             // 用满时也会停，而那种情况 finish_reason 未必是 length——猜出来的标记会把
             // "上下文不够了"伪装成"上限设小了"，正是这一页最该避免的误导。
@@ -1247,6 +1328,7 @@ async function send(p) {
     // 一个字都没吐出来的话首字延迟是不存在的，写"—"而不是编一个数出来。
     setPerf(p, "首字 " + (p.ttft === null ? "—" : p.ttft.toFixed(1) + "s")
                + " · <b>" + r.rate.toFixed(2) + "</b> tok/s");
+    histUpsert(p);   // 这一轮落账后，把这段对话存进"历史对话"（用于重开演示 KV 复用/冷读回）
     return r;
   } catch (err) {
     bubble.textContent = "出错：" + err.message;
@@ -1357,45 +1439,17 @@ function updateGlobal() {
   }
 }
 
-// 四路汇总那一句。**这里有两种"平均"，混用会把结论说反**：
-//
-//   · 各路速率和 = Σ(tok_i / el_i)：每条路径**自己**跑了多快。四路同时跑时把它们相加，
-//     就是"整块板此刻一共在吐多少 token"。口径和单路基线**完全一样**（都是"某一路的
-//     速率"），所以伸缩比只能用这个。
-//   · 墙钟摊薄 = Σtok_i / 墙钟：把总 token 摊到整段墙上。四路长度不齐时它会**凭空变小**：
-//     某一路在做长生成，另外三路早答完了，后面那一大段只有一路在跑，于是"1 路的吞吐"
-//     被摊进了"4 路并发"的分母——量到的不是并发性能，是"平均有几路在跑"。
-//
-// 实测（2026-09-18 网页四路：153/182/1602/158 tok，墙钟 135.7s）：速率和 41.42 tok/s、
-// 墙钟摊薄 15.43 tok/s，而平均只有 1.37/4 路在跑。**差 2.7 倍，不是误差，是两个问题。**
-// 所以：速率和当主数，摊薄值只在四路长度齐的时候才有意义，不齐就当场说明白是它被摊薄了。
-//
-// （原来的写法只有摊薄值这一个数，标题还写着"聚合"——四路里有一路跑了 135s 时，
-//   屏幕上给出 15.43，看着跟单路基线 10.6 是一路的，"四路并发没什么用"就是这么读出来的。）
+// 四路汇总那一句：主数用**各路速率和** = Σ(tok_i / el_i)——口径与单路基线完全一致
+// （都是"某一路的速率"），四路同时跑时它代表"整块板此刻一共在吐多少 token"，伸缩比用它。
 function summarize(rs, wall, baseline) {
   const n = rs.length;
   const total = rs.reduce(function (a, r) { return a + r.tok; }, 0);
   const solo  = rs.reduce(function (a, r) { return a + r.tok / Math.max(r.el, 0.001); }, 0);
-  const w     = Math.max(wall, 0.001);
-  const agg   = total / w;
-  const den   = rs.reduce(function (a, r) { return a + r.el; }, 0) / w;
   let html = n + " 路并发：各路速率和 <b>" + solo.toFixed(2) + " tok/s</b>（合计 " + total
            + " tok / 墙钟 " + wall.toFixed(1) + "s）";
-  if (den < n - 0.5) {
-    // 摊薄警告：这是分母里混进了空转时间，不是"并发退化"。
-    // 路数写成 n 而不是"四路"：窗口能增删之后屏幕上可能只有 2 路，说"四路"是假话，
-    // 而这句话正是判读那两个数的关键（它解释的是分母里混进了什么）。
-    html += " · <span style='color:var(--warn)'>" + n + " 路长短不齐，平均只有 " + den.toFixed(2) + "/"
-          + n + " 路在跑</span>，墙钟摊薄 " + agg.toFixed(2) + " tok/s（空转的路也算进了分母，"
-          + "别当并发性能看）";
-  } else {
-    html += " · 墙钟摊薄 " + agg.toFixed(2) + " tok/s（" + n + " 路差不多同时收工，二者等价）";
-  }
   if (baseline) {
     html += " · <span style='color:var(--warn)'>伸缩 " + (solo / baseline).toFixed(2)
           + "×</span>（基线 " + baseline.toFixed(2) + " tok/s，同一口径）";
-  } else {
-    html += " · （先点「①」量个单路基线，就能看到伸缩比）";
   }
   // 有哪一路排过队，上面的数就都不是并发性能（分母里混进了等待），必须当场说破——
   // 不然"某一路没拿到会话"的现场会被读成"并发退化"。**放整句最后**：它撤的是前面
@@ -1517,10 +1571,170 @@ function resetAll() {
   updateGlobal();
 }
 
+// ================= 历史对话（localStorage；用于演示 KV 复用 / 换页冷读回）=================
+// 约束与设计：
+//  · 覆盖层 fixed 定位、不参与主布局；「关闭窗口（×）」语义不变（仍当场交还会话，page_check 校验）。
+//  · 每轮结束把「身份 + 消息」存进 localStorage；重开时**沿用同一 convId**：
+//    网关按身份认对话——命中 KV 就复用（base>0），若这段对话已被闲置回收换页到 /dev/shm，
+//    则从冷存读回。**想看换页效果：别按 ×，让它闲置**（× 会显式交还、清掉盘上记录）。
+const HIST_KEY = "kvdemo_hist_v1";
+let histEntries = [];
+// 网关此刻的会话状态（来自 /v1/system 的 gateway.active_keys / swapped_keys），用于给历史条目
+// 标"活跃 / 冷存 / —"。键形如 `id:web-1`（与网关的会话身份一致）。
+let gwActive = {}, gwCold = {};
+let histOpen = false;   // 覆盖层是否打开（用 JS 标志，不依赖 DOM 属性——桩 DOM 没有 hasAttribute）
+
+function histLoad() {
+  try {
+    const s = localStorage.getItem(HIST_KEY);
+    histEntries = s ? JSON.parse(s) : [];
+  } catch (e) { histEntries = []; }
+  if (!Array.isArray(histEntries)) { histEntries = []; }
+}
+function histSaveAll() {
+  try { localStorage.setItem(HIST_KEY, JSON.stringify(histEntries)); } catch (e) { /* 隐私模式等 */ }
+}
+function histUpsert(p) {
+  if (!p.messages || p.messages.length === 0) { return; }
+  const first = p.messages.find(function (m) { return m.role === "user"; });
+  const rec = {
+    id: p.convId,
+    title: (first ? first.content : "(空对话)").slice(0, 40),
+    msgs: p.messages.slice(),
+    ts: Date.now(),
+  };
+  const i = histEntries.findIndex(function (e) { return e.id === rec.id; });
+  if (i >= 0) { histEntries[i] = rec; } else { histEntries.unshift(rec); }
+  if (histEntries.length > 30) { histEntries.length = 30; }
+  histSaveAll();
+  histRender();
+}
+function fmtAgo(ts) {
+  const s = Math.max(0, (Date.now() - ts) / 1000);
+  return s < 60 ? Math.round(s) + "s 前"
+    : (s < 3600 ? Math.round(s / 60) + "m 前" : Math.round(s / 3600) + "h 前");
+}
+function histRender() {
+  const list = document.getElementById("histlist");
+  if (!list) { return; }
+  if (!histEntries.length) {
+    list.innerHTML = '<div class="hempty">还没有历史对话。在上面发一轮，这里就会出现。</div>';
+    return;
+  }
+  list.innerHTML = histEntries.map(function (e) {
+    const round = Math.max(0, Math.ceil((e.msgs ? e.msgs.length : 0) / 2));
+    const label = "id:" + e.id;
+    let stTxt = "—", stCls = "hst hst-x";
+    if (gwActive[label]) { stTxt = "活跃"; stCls = "hst hst-a"; }
+    else if (gwCold[label]) { stTxt = "冷存"; stCls = "hst hst-c"; }
+    return '<div class="hrow" data-id="' + esc(e.id) + '">' +
+      '<div class="ht"><b>' + esc(e.title || "(无标题)") + "</b>" +
+      "<span>" + round + " 轮 · " + fmtAgo(e.ts) + " · " + esc(e.id) +
+      ' · <span class="' + stCls + '">' + stTxt + "</span></span></div>" +
+      '<button class="btn-secondary" data-act="open">打开</button>' +
+      '<button class="btn-secondary" data-act="del">删除</button></div>';
+  }).join("");
+}
+function toggleHist(open) {
+  histOpen = (open === undefined) ? !histOpen : !!open;
+  if (histOpen) { histRender(); }
+  // 防御性：桩 DOM（page_check）没有 setAttribute/removeAttribute；真浏览器有。
+  const ov = document.getElementById("histov");
+  if (ov) {
+    if (histOpen) {
+      if (ov.removeAttribute) { ov.removeAttribute("hidden"); }
+      if ("hidden" in ov) { ov.hidden = false; }
+    } else {
+      if (ov.setAttribute) { ov.setAttribute("hidden", ""); }
+      if ("hidden" in ov) { ov.hidden = true; }
+    }
+  }
+}
+function delHist(id, closeToo) {
+  const i = histEntries.findIndex(function (e) { return e.id === id; });
+  if (i >= 0) { histEntries.splice(i, 1); histSaveAll(); histRender(); }
+  if (closeToo) { closeConv(id); }
+}
+// 重开：优先放一个空闲面板；已满就复用**第一个**面板（先交还它原来的会话）。
+// 关键：`p.convId = e.id` 沿用同一身份 —— 这是能复用 / 冷读回 KV 的前提。
+function openHist(id) {
+  const e = histEntries.find(function (x) { return x.id === id; });
+  if (!e) { return; }
+  let p;
+  if (panels.length < Math.min(MAX_PANELS_ON_SCREEN, MAX_SESSIONS)) {
+    p = addPanel();
+  } else {
+    p = panels[0];
+    closeConv(p.convId);
+  }
+  p.convId = e.id;
+  p.messages = e.msgs.slice();
+  p.paused = false; p.bubble = null; p.ttft = null; p.streaming = false;
+  p.log.innerHTML = "";
+  p.messages.forEach(function (m) {
+    addMsg(p, m.role === "user" ? "u" : "a", m.role === "user" ? "你" : "模型", m.content);
+  });
+  p.input.value = "";
+  grow(p.input);
+  render(p); renumber(); renderCap(); updateGlobal();
+  toggleHist(false);
+  setStat(p, "已从历史打开 <b>" + esc(e.id) + "</b>；接着问一句即可看出 KV 复用/冷读回");
+}
+// 把当前窗口开成一段**新对话**：旧对话的每一轮已存进历史，这里**不 closeConv**——让它留在
+// 网关里，闲置后被回收 → 换页成冷存。用于造出"多于会话数"的对话，演示卸载能同时挂很多段。
+function newConversation() {
+  let p = null;
+  for (let i = 0; i < panels.length; i++) { if (!panels[i].streaming) { p = panels[i]; break; } }
+  if (!p) { return; }
+  p.convId = newConvId();
+  p.messages = [];
+  p.log.innerHTML = "";
+  p.sess.textContent = "";
+  p.stat.textContent = "";
+  p.perf.innerHTML = "";
+  p.ttft = null; p.paused = false; p.bubble = null;
+  p.input.value = "";
+  grow(p.input);
+  render(p); updateGlobal();
+  setStat(p, "已开新对话 <b>" + esc(p.convId) + "</b>（旧对话留在网关，闲置后换页冷存）");
+}
+
+function initHist() {
+  histLoad();
+  const b = document.getElementById("hist");
+  if (b) { b.addEventListener("click", function () { toggleHist(); }); }
+  const ov = document.getElementById("histov");
+  if (ov) {
+    ov.addEventListener("click", function (ev) {
+      if (ev.target === ov) { toggleHist(false); return; }
+      const btn = (ev.target && ev.target.closest) ? ev.target.closest("button[data-act]") : null;
+      if (!btn) { return; }
+      const row = (btn.closest ? btn.closest(".hrow") : null);
+      const id = row ? row.getAttribute("data-id") : null;
+      if (!id) { return; }
+      if (btn.getAttribute("data-act") === "open") { openHist(id); }
+      else { delHist(id, false); }
+    });
+  }
+  const x = document.getElementById("histclose");
+  if (x) { x.addEventListener("click", function () { toggleHist(false); }); }
+  const c = document.getElementById("histclear");
+  if (c) {
+    c.addEventListener("click", function () {
+      histEntries.forEach(function (e) { closeConv(e.id); });
+      histEntries = []; histSaveAll(); histRender();
+    });
+  }
+  const nc = document.getElementById("newconv");
+  if (nc) { nc.addEventListener("click", newConversation); }
+  histRender();
+}
+
 // 窗口数上限在**建面板之前**就要拿到，所以顺序不能反：反过来是先摆出兜底的 4 个窗口、
 // 等 /health 回来再砍掉多的——屏幕上先闪一下再消失，更糟的是那 4 个窗口一旦发过请求
 // 就已经把会话占住了。读不到 /health（页面被当本地文件打开、网关没起）就按兜底值走。
 // capReady 交出去给 page_check.js 等（它是异步的，检查脚本必须等它落地再数面板）。
+initHist();
 let capReady = refreshHealth().then(function () {
   buildPanels();
   updateGlobal();
