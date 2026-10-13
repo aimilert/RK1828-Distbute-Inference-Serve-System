@@ -1,7 +1,7 @@
 # 贡献指南（Contributing）
 
 本仓库在 **RK3588 + 4×RK1828** 的边缘设备上提供多路并发大模型推理服务。改动前请先读
-[`README.md`](README.md) 与 [`docs/README.md`](docs/README.md)，它们说明了系统的边界与
+[`README.md`](README.md) 与 [`docs/USAGE.md`](docs/USAGE.md)，它们说明了系统的边界与
 已知限制。
 
 ## 1. 项目结构
@@ -56,7 +56,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && cmak
 ## 4. 运行与验证
 
 ```bash
-# 启动网关（模型加载约 4 分钟；路径按实际填）
+# 启动网关（模型加载：串行 ~140s / PARALLEL_LOAD=1 ~62s；路径按实际填）
 cd gateway
 INSTALL_DIR=… NSESSION=2 MODEL_DIR=… bash start_gateway.sh
 
