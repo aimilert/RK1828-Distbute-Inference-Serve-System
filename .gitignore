@@ -53,3 +53,13 @@ docs/面向复合AI负载*
 docs/端侧Claude接入创新点总结.md
 docs/端侧MLFQ调度-*
 docs/端侧KV内存与上下文卸载-*
+# 产品总结书 / 测试数据 / 临时报告（内部资料，不入库）
+docs/产品总结书/
+docs/测试数据/
+report_*.docx
+
+# ---- 运行/实验产物（补充）----
+# 网关请求转储（DUMP_REQ=1 生成）
+gateway/request_dump.jsonl
+# 调试探针的原始产物（与 tools/perf_results/ 同理，不入库）
+tests/perf_results/
